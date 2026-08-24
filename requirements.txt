@@ -1,0 +1,4 @@
+python-dotenv
+websockets
+pyaudio
+protobuf
