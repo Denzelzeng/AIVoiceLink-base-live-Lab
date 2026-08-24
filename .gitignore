@@ -4,6 +4,9 @@
 !.env.example
 *apiKey*.csv
 
+# Local Codex/agent instructions
+AGENTS.md
+
 # Python bytecode, virtual environments, and test tooling
 **/__pycache__/
 *.py[cod]
