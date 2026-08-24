@@ -19,3 +19,4 @@ venv/
 # Local editor configuration and generated results
 .vscode/
 tmp/
+AGENTS.md

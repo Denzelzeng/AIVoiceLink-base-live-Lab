@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simultrans-baseline"
+version = "0.1.0"
+description = "Modular real-time speech recognition, translation, and voice-cloned TTS baseline"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.28,<1",
+  "python-dotenv>=1.0,<2",
+]
+
+[project.optional-dependencies]
+audio = ["PyAudio>=0.2.14,<0.3"]
+
+[project.scripts]
+simultrans = "simultrans_baseline.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

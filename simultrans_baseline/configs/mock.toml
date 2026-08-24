@@ -1,0 +1,63 @@
+[session]
+source_language = "Chinese"
+target_language = "English"
+audio_output = false
+domain = "demo"
+
+[asr]
+provider = "mock"
+base_url = "mock://asr"
+model = "scripted-asr"
+
+[mt]
+provider = "mock"
+base_url = "mock://mt"
+model = "scripted-mt"
+
+[tts]
+provider = "mock"
+base_url = "mock://tts"
+model = "mock-clone-tts"
+sample_rate = 24000
+
+[audio]
+sample_rate = 16000
+channels = 1
+sample_width = 2
+frame_ms = 50
+energy_threshold = 350
+calibration_seconds = 0.0
+pre_roll_ms = 200
+min_speech_ms = 300
+end_silence_ms = 500
+partial_interval_ms = 1000
+max_turn_ms = 10000
+
+[streaming]
+asr_agreement_depth = 2
+mt_agreement_depth = 2
+min_source_growth_chars = 2
+tts_min_phrase_chars = 4
+queue_capacity = 6
+recent_context_turns = 3
+semantic_hard_timeout_ms = 1800
+barge_in_enabled = false
+
+[endpoint]
+provider = "heuristic"
+base_url = ""
+model = "mock-endpoint"
+api_key_env = ""
+timeout_seconds = 1.0
+complete_threshold = 0.5
+max_audio_ms = 8000
+
+[voice_clone]
+enabled = true
+consent_confirmed = true
+min_reference_ms = 2500
+max_reference_ms = 4000
+wait_timeout_ms = 1000
+fallback_policy = "skip"
+refresh_enabled = true
+delete_on_close = true

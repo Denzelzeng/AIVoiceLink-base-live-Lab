@@ -1,0 +1,87 @@
+[session]
+source_language = "Chinese"
+target_language = "English"
+audio_output = true
+domain = "technical meeting"
+
+[asr]
+provider = "dashscope_asr"
+base_url = "env:WORKSPACE_OPENAI_BASE_URL"
+model = "qwen3-asr-flash-2026-02-10"
+api_key_env = "DASHSCOPE_API_KEY"
+timeout_seconds = 45.0
+max_tokens = 512
+temperature = 0.0
+send_language = true
+
+[mt]
+provider = "qwen_mt"
+base_url = "env:WORKSPACE_OPENAI_BASE_URL"
+model = "qwen-mt-flash"
+api_key_env = "DASHSCOPE_API_KEY"
+timeout_seconds = 45.0
+max_tokens = 256
+temperature = 0.0
+send_language = false
+
+[tts]
+provider = "dashscope_qwen_voice_clone"
+base_url = "env:WORKSPACE_API_BASE_URL"
+model = "qwen3-tts-vc-2026-01-22"
+api_key_env = "DASHSCOPE_API_KEY"
+timeout_seconds = 60.0
+max_tokens = 1
+temperature = 0.0
+enrollment_model = "qwen-voice-enrollment"
+preferred_name = "simultrans"
+clone_path = "/api/v1/services/audio/tts/customization"
+speech_path = "/api/v1/services/aigc/multimodal-generation/generation"
+sample_rate = 24000
+response_format = "pcm"
+fallback_voice = ""
+
+[audio]
+sample_rate = 24000
+channels = 1
+sample_width = 2
+frame_ms = 50
+energy_threshold = 350
+calibration_seconds = 1.0
+pre_roll_ms = 200
+min_speech_ms = 300
+end_silence_ms = 450
+partial_interval_ms = 1200
+max_turn_ms = 10000
+
+[streaming]
+asr_agreement_depth = 2
+mt_agreement_depth = 2
+min_source_growth_chars = 2
+tts_min_phrase_chars = 8
+queue_capacity = 6
+recent_context_turns = 3
+semantic_hard_timeout_ms = 1800
+# Input speech never pauses or cancels translated playback. VAD still segments
+# source audio and semantic endpointing still decides text boundaries.
+barge_in_enabled = false
+
+[endpoint]
+provider = "llm_http"
+base_url = "env:WORKSPACE_OPENAI_BASE_URL"
+model = "qwen-flash"
+api_key_env = "DASHSCOPE_API_KEY"
+timeout_seconds = 4.0
+max_tokens = 8
+temperature = 0.0
+complete_threshold = 0.5
+max_audio_ms = 8000
+
+[voice_clone]
+enabled = true
+consent_confirmed = false
+min_reference_ms = 3000
+max_reference_ms = 4000
+wait_timeout_ms = 15000
+fallback_policy = "skip"
+refresh_enabled = true
+delete_on_close = true
