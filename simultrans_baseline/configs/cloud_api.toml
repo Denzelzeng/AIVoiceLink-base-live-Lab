@@ -40,7 +40,7 @@ sample_rate = 24000
 response_format = "pcm"
 fallback_voice = ""
 websocket_url = "auto"
-speech_rate = 1.3
+speech_rate = 1.45
 
 [audio]
 sample_rate = 24000
@@ -84,11 +84,10 @@ reference_update_alpha = 0.10
 [streaming]
 asr_agreement_depth = 2
 mt_agreement_depth = 2
-min_source_growth_chars = 2
+min_source_growth_chars = 8
 tts_min_phrase_chars = 8
-# Buffer a small amount of each cloud response before speaker playback. This
-# trades 400 ms startup latency for smoother audio during network jitter.
-tts_prebuffer_ms = 400
+# Keep enough PCM to absorb ordinary jitter without adding a large fixed delay.
+tts_prebuffer_ms = 200
 queue_capacity = 6
 recent_context_turns = 3
 semantic_hard_timeout_ms = 1800

@@ -105,10 +105,19 @@ class ConsoleRenderer:
             self._print("[打断] 检测到新讲话，已取消旧的待播放译音")
         elif event.kind == "turn.metrics":
             self._print(
-                f"[延迟{turn}] 译文={event.data.get('first_target_commit_ms')} ms；"
+                f"[延迟{turn}] 句长={event.data.get('utterance_ms')} ms；"
+                f"ASR排队={event.data.get('final_asr_queue_ms')} ms；"
+                f"ASR请求={event.data.get('final_asr_request_ms')} ms；"
+                f"端点={event.data.get('endpoint_request_ms')} ms；"
+                f"翻译排队={event.data.get('final_mt_queue_ms')} ms；"
+                f"翻译请求={event.data.get('final_mt_request_ms')} ms；"
+                f"合并=ASR {event.data.get('asr_updates_coalesced') or 0:g}/"
+                f"MT {event.data.get('mt_updates_coalesced') or 0:g}；"
+                f"抢占=ASR {event.data.get('asr_partials_cancelled') or 0:g}/"
+                f"MT {event.data.get('mt_partials_cancelled') or 0:g}；"
+                f"译文={event.data.get('first_target_commit_ms')} ms；"
                 f"云首音={event.data.get('first_cloud_audio_ms')} ms；"
                 f"播放排队={event.data.get('playback_queue_ms')} ms；"
-                f"句间静音={event.data.get('playback_gap_ms')} ms；"
                 f"首播放={event.data.get('first_audio_ms')} ms"
             )
         elif event.kind == "pipeline.error":

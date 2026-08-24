@@ -4,7 +4,9 @@ import asyncio
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Generic, TypeVar
 
 from .config import AppConfig
 from .contracts import (
@@ -27,6 +29,7 @@ class _TranslationWork:
     turn_id: int
     source_text: str
     is_final: bool
+    enqueued_at: float = field(default_factory=time.monotonic)
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,7 @@ class _TTSWork:
     text: str
     playback_epoch: int
     is_final: bool = False
+    enqueued_at: float = field(default_factory=time.monotonic)
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,127 @@ class _PlaybackWork:
     is_first: bool = False
     is_last: bool = False
     is_final: bool = False
+
+
+_WorkT = TypeVar("_WorkT")
+
+
+@dataclass(frozen=True)
+class _QueuedWork(Generic[_WorkT]):
+    value: _WorkT
+    enqueued_at: float
+    coalesced: int = 0
+
+
+class _LatestPartialMailbox(Generic[_WorkT]):
+    """Lossless finals with at most one pending snapshot per logical key.
+
+    ``put`` is deliberately synchronous: microphone capture must never wait for
+    a slow cloud request.  A newer partial replaces the queued partial for the
+    same turn, and a final replaces that partial while retaining its position.
+    Finals for different turns are never discarded or reordered.
+    """
+
+    def __init__(
+        self,
+        *,
+        key: Callable[[_WorkT], int],
+        is_final: Callable[[_WorkT], bool],
+    ) -> None:
+        self._key = key
+        self._is_final = is_final
+        self._items: deque[_QueuedWork[_WorkT]] = deque()
+        self._available = asyncio.Event()
+        self._changed = asyncio.Event()
+        self._closed = False
+
+    def put(self, value: _WorkT) -> None:
+        if self._closed:
+            raise RuntimeError("mailbox is closed")
+        key = self._key(value)
+        queued = _QueuedWork(value=value, enqueued_at=time.monotonic())
+        for index, current in enumerate(self._items):
+            if self._key(current.value) != key:
+                continue
+            if self._is_final(current.value):
+                # A final is authoritative; a late partial cannot supersede it.
+                return
+            self._items[index] = _QueuedWork(
+                value=value,
+                enqueued_at=queued.enqueued_at,
+                coalesced=current.coalesced + 1,
+            )
+            self._available.set()
+            self._changed.set()
+            return
+        self._items.append(queued)
+        self._available.set()
+        self._changed.set()
+
+    def close(self) -> None:
+        self._closed = True
+        self._available.set()
+        self._changed.set()
+
+    async def get(self) -> _QueuedWork[_WorkT] | None:
+        while not self._items:
+            if self._closed:
+                return None
+            self._available.clear()
+            # No task switch occurs between clear and this check, avoiding a
+            # missed wake-up without placing a lock on the capture path.
+            if self._items or self._closed:
+                continue
+            await self._available.wait()
+        item = self._items.popleft()
+        if not self._items and not self._closed:
+            self._available.clear()
+        return item
+
+    async def wait_for_final(self, key: int) -> bool:
+        """Wait until a final for ``key`` is pending, or closure makes it impossible."""
+        while True:
+            if any(
+                self._key(item.value) == key and self._is_final(item.value)
+                for item in self._items
+            ):
+                return True
+            if self._closed:
+                return False
+            self._changed.clear()
+            if any(
+                self._key(item.value) == key and self._is_final(item.value)
+                for item in self._items
+            ) or self._closed:
+                continue
+            await self._changed.wait()
+
+
+_ResultT = TypeVar("_ResultT")
+
+
+async def _run_until_final(
+    request: Awaitable[_ResultT],
+    *,
+    mailbox: _LatestPartialMailbox[_WorkT],
+    key: int,
+) -> tuple[bool, _ResultT | None]:
+    """Run a partial request, cancelling it when its authoritative final arrives."""
+    request_task = asyncio.create_task(request)
+    final_task = asyncio.create_task(mailbox.wait_for_final(key))
+    done, _ = await asyncio.wait(
+        (request_task, final_task),
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if request_task in done:
+        final_task.cancel()
+        await asyncio.gather(final_task, return_exceptions=True)
+        return False, await request_task
+    if await final_task:
+        request_task.cancel()
+        await asyncio.gather(request_task, return_exceptions=True)
+        return True, None
+    return False, await request_task
 
 
 def _join_text(prefix: str, suffix: str) -> str:
@@ -105,9 +230,14 @@ class RealtimeInterpretationPipeline:
         )
 
     async def run(self, source: AudioWindowSource) -> None:
-        capacity = self.config.streaming.queue_capacity
-        window_queue: asyncio.Queue[AudioWindow | None] = asyncio.Queue(capacity)
-        mt_queue: asyncio.Queue[_TranslationWork | None] = asyncio.Queue(capacity)
+        window_queue = _LatestPartialMailbox[AudioWindow](
+            key=lambda window: window.turn_id,
+            is_final=lambda window: window.is_final,
+        )
+        mt_queue = _LatestPartialMailbox[_TranslationWork](
+            key=lambda work: work.turn_id,
+            is_final=lambda work: work.is_final,
+        )
         # Text/audio output is an independent chain.  Do not back-pressure ASR/MT
         # merely because speech is currently longer than synthesized playback.
         tts_queue: asyncio.Queue[_TTSWork | None] = asyncio.Queue()
@@ -201,21 +331,21 @@ class RealtimeInterpretationPipeline:
     async def _produce_windows(
         self,
         source: AudioWindowSource,
-        queue: asyncio.Queue[AudioWindow | None],
+        queue: _LatestPartialMailbox[AudioWindow],
     ) -> None:
         try:
             async for window in source:
-                await queue.put(window)
+                queue.put(window)
                 if window.is_final:
                     self._speech_idle.set()
         finally:
             self._speech_idle.set()
-            await queue.put(None)
+            queue.close()
 
     async def _asr_worker(
         self,
-        queue: asyncio.Queue[AudioWindow | None],
-        mt_queue: asyncio.Queue[_TranslationWork | None],
+        queue: _LatestPartialMailbox[AudioWindow],
+        mt_queue: _LatestPartialMailbox[_TranslationWork],
     ) -> None:
         logical_turn_id = 1
         logical_prefix = ""
@@ -257,7 +387,7 @@ class RealtimeInterpretationPipeline:
                 },
             )
             if source_text:
-                await mt_queue.put(_TranslationWork(turn_id, source_text, True))
+                mt_queue.put(_TranslationWork(turn_id, source_text, True))
             logical_turn_id += 1
             logical_prefix = ""
             current_segment_id = None
@@ -270,25 +400,10 @@ class RealtimeInterpretationPipeline:
 
         try:
             while True:
-                window = await queue.get()
-                if window is None:
+                queued_window = await queue.get()
+                if queued_window is None:
                     break
-                input_closed = False
-                if not window.is_final:
-                    # Cumulative partials become stale quickly when cloud ASR latency
-                    # exceeds the capture interval. Keep only the newest queued
-                    # snapshot for this acoustic segment.
-                    while True:
-                        try:
-                            newer = queue.get_nowait()
-                        except asyncio.QueueEmpty:
-                            break
-                        if newer is None:
-                            input_closed = True
-                            break
-                        window = newer
-                        if window.is_final:
-                            break
+                window = queued_window.value
                 if window.turn_id != current_segment_id:
                     endpoint_generation += 1
                     if endpoint_task and not endpoint_task.done():
@@ -306,10 +421,41 @@ class RealtimeInterpretationPipeline:
                 timing = self._timing.setdefault(
                     logical_turn_id, {"audio_started": window.started_at}
                 )
-                hypothesis = await self.asr.transcribe(
+                if queued_window.coalesced:
+                    timing["asr_updates_coalesced"] = (
+                        timing.get("asr_updates_coalesced", 0.0)
+                        + queued_window.coalesced
+                    )
+                request_started = time.monotonic()
+                if window.is_final:
+                    timing["audio_ended"] = window.captured_at
+                    timing["final_asr_queue_ms"] = max(
+                        0.0,
+                        (request_started - queued_window.enqueued_at) * 1_000,
+                    )
+                asr_request = self.asr.transcribe(
                     window,
                     language=self.config.session.source_language,
                 )
+                if window.is_final:
+                    hypothesis = await asr_request
+                else:
+                    cancelled, partial_hypothesis = await _run_until_final(
+                        asr_request,
+                        mailbox=queue,
+                        key=window.turn_id,
+                    )
+                    if cancelled:
+                        timing["asr_partials_cancelled"] = (
+                            timing.get("asr_partials_cancelled", 0.0) + 1
+                        )
+                        continue
+                    assert partial_hypothesis is not None
+                    hypothesis = partial_hypothesis
+                if window.is_final:
+                    timing["final_asr_request_ms"] = (
+                        time.monotonic() - request_started
+                    ) * 1_000
                 if self._voice:
                     await self._voice.observe(
                         window,
@@ -343,11 +489,15 @@ class RealtimeInterpretationPipeline:
                         started_at=window.started_at,
                         captured_at=window.captured_at,
                     )
+                    endpoint_started = time.monotonic()
                     decision = await self.endpoint.classify(
                         endpoint_window,
                         transcript=hypothesis,
                         language=self.config.session.source_language,
                     )
+                    timing["endpoint_request_ms"] = (
+                        time.monotonic() - endpoint_started
+                    ) * 1_000
                     logical_final = decision.complete
                     await self._emit(
                         "endpoint.decision",
@@ -377,14 +527,12 @@ class RealtimeInterpretationPipeline:
                     logical_final
                     or growth >= self.config.streaming.min_source_growth_chars
                 ):
-                    await mt_queue.put(
+                    mt_queue.put(
                         _TranslationWork(logical_turn_id, aggregate, logical_final)
                     )
                     last_sent = aggregate
 
                 if not window.is_final:
-                    if input_closed:
-                        break
                     continue
                 if logical_final:
                     logical_turn_id += 1
@@ -406,8 +554,6 @@ class RealtimeInterpretationPipeline:
                 endpoint_task = asyncio.create_task(
                     hard_finalize(generation, logical_turn_id, aggregate)
                 )
-                if input_closed:
-                    break
 
             if endpoint_task and not endpoint_task.done():
                 endpoint_generation += 1
@@ -424,15 +570,15 @@ class RealtimeInterpretationPipeline:
                         "reason": "input closed",
                     },
                 )
-                await mt_queue.put(
+                mt_queue.put(
                     _TranslationWork(logical_turn_id, last_aggregate, True)
                 )
         finally:
-            await mt_queue.put(None)
+            mt_queue.close()
 
     async def _mt_worker(
         self,
-        queue: asyncio.Queue[_TranslationWork | None],
+        queue: _LatestPartialMailbox[_TranslationWork],
         tts_queue: asyncio.Queue[_TTSWork | None],
     ) -> None:
         committers: dict[int, AgreementCommitter] = {}
@@ -443,9 +589,10 @@ class RealtimeInterpretationPipeline:
         segment_numbers: dict[int, int] = {}
         try:
             while True:
-                work = await queue.get()
-                if work is None:
+                queued_work = await queue.get()
+                if queued_work is None:
                     break
+                work = queued_work.value
                 committer = committers.setdefault(
                     work.turn_id,
                     AgreementCommitter(self.config.streaming.mt_agreement_depth),
@@ -462,7 +609,23 @@ class RealtimeInterpretationPipeline:
                         data={"delta": text},
                     )
 
-                hypothesis = await self.translator.translate(
+                timing = self._timing.setdefault(
+                    work.turn_id, {"audio_started": time.monotonic()}
+                )
+                if queued_work.coalesced:
+                    timing["mt_updates_coalesced"] = (
+                        timing.get("mt_updates_coalesced", 0.0)
+                        + queued_work.coalesced
+                    )
+                translation_started = time.monotonic()
+                queue_ms = max(
+                    0.0,
+                    (translation_started - queued_work.enqueued_at) * 1_000,
+                )
+                timing.setdefault("first_mt_queue_ms", queue_ms)
+                if work.is_final:
+                    timing["final_mt_queue_ms"] = queue_ms
+                translation_request = self.translator.translate(
                     work.source_text,
                     source_language=self.config.session.source_language,
                     target_language=self.config.session.target_language,
@@ -471,10 +634,26 @@ class RealtimeInterpretationPipeline:
                     domain=self.config.session.domain,
                     on_delta=on_delta,
                 )
+                if work.is_final:
+                    hypothesis = await translation_request
+                else:
+                    cancelled, partial_hypothesis = await _run_until_final(
+                        translation_request,
+                        mailbox=queue,
+                        key=work.turn_id,
+                    )
+                    if cancelled:
+                        timing["mt_partials_cancelled"] = (
+                            timing.get("mt_partials_cancelled", 0.0) + 1
+                        )
+                        continue
+                    assert partial_hypothesis is not None
+                    hypothesis = partial_hypothesis
+                request_ms = (time.monotonic() - translation_started) * 1_000
+                timing.setdefault("first_mt_request_ms", request_ms)
+                if work.is_final:
+                    timing["final_mt_request_ms"] = request_ms
                 update = committer.update(hypothesis, is_final=work.is_final)
-                timing = self._timing.setdefault(
-                    work.turn_id, {"audio_started": time.monotonic()}
-                )
                 if update.commit_delta and "first_target_commit" not in timing:
                     timing["first_target_commit"] = time.monotonic()
                 await self._emit(
@@ -540,6 +719,13 @@ class RealtimeInterpretationPipeline:
                     if work.is_final:
                         await self._emit_turn_metrics(work.turn_id)
                     continue
+                timing = self._timing.setdefault(
+                    work.turn_id, {"audio_started": time.monotonic()}
+                )
+                timing.setdefault(
+                    "tts_queue_ms",
+                    max(0.0, (time.monotonic() - work.enqueued_at) * 1_000),
+                )
                 if work.playback_epoch != self._playback_epoch:
                     await self._emit(
                         "tts.cancelled",
@@ -772,6 +958,28 @@ class RealtimeInterpretationPipeline:
             else None
         )
         values["playback_gap_ms"] = timing.get("playback_gap_ms")
+        audio_ended = timing.get("audio_ended")
+        values["utterance_ms"] = (
+            round((audio_ended - started) * 1_000, 1)
+            if audio_ended is not None and started is not None
+            else None
+        )
+        for key in (
+            "final_asr_queue_ms",
+            "final_asr_request_ms",
+            "endpoint_request_ms",
+            "first_mt_queue_ms",
+            "first_mt_request_ms",
+            "final_mt_queue_ms",
+            "final_mt_request_ms",
+            "tts_queue_ms",
+            "asr_updates_coalesced",
+            "mt_updates_coalesced",
+            "asr_partials_cancelled",
+            "mt_partials_cancelled",
+        ):
+            value = timing.get(key)
+            values[key] = round(value, 1) if value is not None else None
         await self._emit("turn.metrics", turn_id=turn_id, data=values)
 
     async def _emit(

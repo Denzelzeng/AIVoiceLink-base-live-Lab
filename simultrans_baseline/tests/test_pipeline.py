@@ -489,7 +489,217 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertLess(asr.calls, 4)
+        # The pending partials collapse and the in-flight partial is preempted,
+        # so only the authoritative final request completes.
+        self.assertEqual(asr.calls, 1)
+
+    async def test_slow_asr_never_backpressures_microphone_or_loses_finals(self) -> None:
+        config = apply_overrides(
+            load_config(ROOT / "configs" / "mock.toml"),
+            audio_output=False,
+        )
+        config = replace(
+            config,
+            streaming=replace(config.streaming, queue_capacity=1),
+        )
+        events: list[PipelineEvent] = []
+
+        class GatedASR(ScriptedASR):
+            def __init__(self):
+                super().__init__([])
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def transcribe(self, audio_window, *, language):
+                del language
+                self.calls += 1
+                if self.calls == 1:
+                    self.started.set()
+                    await self.release.wait()
+                return f"第{audio_window.turn_id}句。"
+
+        class BurstSource:
+            def __init__(self):
+                self.finished = asyncio.Event()
+
+            async def __aiter__(self):
+                started = time.monotonic()
+                for turn_id in range(1, 13):
+                    yield window(turn_id, 600, True, started)
+                    await asyncio.sleep(0)
+                self.finished.set()
+
+        asr = GatedASR()
+        source = BurstSource()
+        pipeline = RealtimeInterpretationPipeline(
+            config,
+            asr=asr,
+            translator=RuleBasedMockTranslator(),
+            endpoint=HeuristicSemanticEndpoint(),
+            tts=None,
+            audio_sink=NullAudioSink(),
+            event_handler=events.append,
+        )
+        task = asyncio.create_task(pipeline.run(source))
+        await asyncio.wait_for(asr.started.wait(), timeout=1)
+        # Even with queue_capacity=1 and ASR stalled, capture drains the burst.
+        await asyncio.wait_for(source.finished.wait(), timeout=0.2)
+        asr.release.set()
+        await asyncio.wait_for(task, timeout=2)
+
+        finals = [
+            event
+            for event in events
+            if event.kind == "transcript.update" and event.data.get("is_final")
+        ]
+        self.assertEqual(asr.calls, 12)
+        self.assertEqual([event.turn_id for event in finals], list(range(1, 13)))
+
+    async def test_final_audio_preempts_a_stuck_partial_asr_request(self) -> None:
+        config = apply_overrides(
+            load_config(ROOT / "configs" / "mock.toml"),
+            audio_output=False,
+        )
+        events: list[PipelineEvent] = []
+
+        class CancellableASR(ScriptedASR):
+            def __init__(self):
+                super().__init__([])
+                self.partial_started = asyncio.Event()
+                self.partial_cancelled = asyncio.Event()
+
+            async def transcribe(self, audio_window, *, language):
+                del language
+                self.calls += 1
+                if not audio_window.is_final:
+                    self.partial_started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        self.partial_cancelled.set()
+                        raise
+                return "最终结果。"
+
+        asr = CancellableASR()
+
+        class FinalizingSource:
+            async def __aiter__(self):
+                started = time.monotonic()
+                yield window(1, 800, False, started)
+                await asr.partial_started.wait()
+                yield window(1, 1_600, True, started)
+
+        pipeline = RealtimeInterpretationPipeline(
+            config,
+            asr=asr,
+            translator=RuleBasedMockTranslator(),
+            endpoint=HeuristicSemanticEndpoint(),
+            tts=None,
+            audio_sink=NullAudioSink(),
+            event_handler=events.append,
+        )
+        await asyncio.wait_for(pipeline.run(FinalizingSource()), timeout=1)
+
+        self.assertTrue(asr.partial_cancelled.is_set())
         self.assertEqual(asr.calls, 2)
+        metrics = next(event for event in events if event.kind == "turn.metrics")
+        self.assertEqual(metrics.data["asr_partials_cancelled"], 1.0)
+
+    async def test_stale_translation_partials_collapse_to_latest_final(self) -> None:
+        config = apply_overrides(
+            load_config(ROOT / "configs" / "mock.toml"),
+            audio_output=False,
+        )
+        config = replace(
+            config,
+            streaming=replace(
+                config.streaming,
+                asr_agreement_depth=1,
+                min_source_growth_chars=1,
+            ),
+        )
+        events: list[PipelineEvent] = []
+
+        class SignallingASR(ScriptedASR):
+            def __init__(self):
+                super().__init__([
+                    "今天",
+                    "今天我们",
+                    "今天我们测试",
+                    "今天我们测试完成。",
+                ])
+                self.processed = [asyncio.Event() for _ in range(4)]
+
+            async def transcribe(self, audio_window, *, language):
+                result = await super().transcribe(audio_window, language=language)
+                self.processed[self.calls - 1].set()
+                return result
+
+        class GatedTranslator(RuleBasedMockTranslator):
+            def __init__(self):
+                super().__init__()
+                self.started = asyncio.Event()
+                self.cancelled = asyncio.Event()
+                self.initiated: list[str] = []
+                self._block_first = True
+
+            async def translate(self, source_text, **kwargs):
+                self.initiated.append(source_text)
+                if self._block_first:
+                    self._block_first = False
+                    self.started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        self.cancelled.set()
+                        raise
+                return await super().translate(source_text, **kwargs)
+
+        asr = SignallingASR()
+        translator = GatedTranslator()
+
+        class PacedSource:
+            async def __aiter__(self):
+                started = time.monotonic()
+                windows = [
+                    window(1, 800, False, started),
+                    window(1, 1_600, False, started),
+                    window(1, 2_400, False, started),
+                    window(1, 3_200, True, started),
+                ]
+                for index, audio_window in enumerate(windows):
+                    yield audio_window
+                    await asr.processed[index].wait()
+                    if index == 0:
+                        await translator.started.wait()
+
+        pipeline = RealtimeInterpretationPipeline(
+            config,
+            asr=asr,
+            translator=translator,
+            endpoint=HeuristicSemanticEndpoint(),
+            tts=None,
+            audio_sink=NullAudioSink(),
+            event_handler=events.append,
+        )
+        task = asyncio.create_task(pipeline.run(PacedSource()))
+        await asyncio.wait_for(asr.processed[-1].wait(), timeout=1)
+        await asyncio.wait_for(translator.cancelled.wait(), timeout=1)
+        await asyncio.wait_for(task, timeout=2)
+
+        self.assertEqual(
+            translator.initiated,
+            ["今天", "今天我们测试完成。"],
+        )
+        self.assertEqual(
+            translator.calls,
+            ["今天我们测试完成。"],
+        )
+        metrics = next(event for event in events if event.kind == "turn.metrics")
+        self.assertEqual(metrics.data["mt_updates_coalesced"], 2.0)
+        self.assertEqual(metrics.data["mt_partials_cancelled"], 1.0)
+        self.assertIsNotNone(metrics.data["final_mt_queue_ms"])
+        self.assertIsNotNone(metrics.data["final_mt_request_ms"])
 
     async def test_first_translation_waits_for_later_voice_enrollment(self) -> None:
         config = apply_overrides(

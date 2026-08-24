@@ -54,6 +54,36 @@ class ConsoleRendererTests(unittest.TestCase):
         self.assertEqual(output.count("\n"), 1)
         self.assertIn("[同传 #1] 试一下。  →  Try it.", output)
 
+    def test_latency_metrics_stay_on_one_diagnostic_line(self) -> None:
+        stream = io.StringIO()
+        renderer = ConsoleRenderer(stream)
+        renderer(
+            event(
+                "turn.metrics",
+                utterance_ms=1200.0,
+                final_asr_queue_ms=20.0,
+                final_asr_request_ms=300.0,
+                endpoint_request_ms=0.2,
+                final_mt_queue_ms=40.0,
+                final_mt_request_ms=250.0,
+                asr_updates_coalesced=2.0,
+                mt_updates_coalesced=3.0,
+                asr_partials_cancelled=1.0,
+                mt_partials_cancelled=1.0,
+                first_target_commit_ms=1800.0,
+                first_cloud_audio_ms=2200.0,
+                playback_queue_ms=100.0,
+                first_audio_ms=2300.0,
+            )
+        )
+
+        output = stream.getvalue()
+        self.assertEqual(output.count("\n"), 1)
+        self.assertIn("ASR排队=20.0 ms", output)
+        self.assertIn("翻译排队=40.0 ms", output)
+        self.assertIn("合并=ASR 2/MT 3", output)
+        self.assertIn("抢占=ASR 1/MT 1", output)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -264,6 +264,10 @@ class AppConfig:
             raise ConfigurationError("asr_agreement_depth must be positive")
         if self.streaming.mt_agreement_depth < 1:
             raise ConfigurationError("mt_agreement_depth must be positive")
+        if self.streaming.min_source_growth_chars < 1:
+            raise ConfigurationError("min_source_growth_chars must be positive")
+        if self.streaming.tts_min_phrase_chars < 1:
+            raise ConfigurationError("tts_min_phrase_chars must be positive")
         if self.streaming.queue_capacity < 1:
             raise ConfigurationError("queue_capacity must be positive")
         if self.streaming.tts_prebuffer_ms < 0:
