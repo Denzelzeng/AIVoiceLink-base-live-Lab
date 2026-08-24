@@ -59,6 +59,25 @@ class TTSConfig(ServiceConfig):
     sample_rate: int = 24_000
     response_format: str = "pcm"
     fallback_voice: str = ""
+    websocket_url: str = "auto"
+    speech_rate: float = 1.0
+
+    @property
+    def normalized_websocket_url(self) -> str:
+        value = self.websocket_url
+        if value.strip().casefold() == "auto":
+            parsed = urlsplit(self.normalized_base_url)
+            return urlunsplit(
+                ("wss", parsed.netloc, "/api-ws/v1/realtime", "", "")
+            )
+        if value.startswith("env:"):
+            variable = value[4:].strip()
+            value = os.getenv(variable, "")
+            if not value:
+                raise ConfigurationError(
+                    f"environment variable {variable} is required for websocket_url"
+                )
+        return value.rstrip("/")
 
 
 @dataclass(frozen=True)
@@ -81,11 +100,46 @@ class AudioConfig:
 
 
 @dataclass(frozen=True)
+class VADConfig:
+    """Local acoustic VAD configuration.
+
+    Neural VAD is deliberately separate from semantic endpointing: it only
+    decides whether speech is present.  The energy implementation remains a
+    dependency-free fallback and is also useful in deterministic tests.
+    """
+
+    provider: str = "energy"
+    model_path: str = ""
+    inference_provider: str = "cpu"
+    threshold: float = 0.5
+    min_speech_ms: int = 150
+    min_silence_ms: int = 100
+    num_threads: int = 1
+
+
+@dataclass(frozen=True)
+class SpeakerChangeConfig:
+    """Independent local speaker-change gate for cloud voice enrollment."""
+
+    enabled: bool = False
+    provider: str = "sherpa_onnx"
+    model_path: str = ""
+    inference_provider: str = "cpu"
+    num_threads: int = 2
+    min_compare_ms: int = 2_000
+    same_threshold: float = 0.72
+    change_threshold: float = 0.55
+    confirmation_windows: int = 1
+    reference_update_alpha: float = 0.10
+
+
+@dataclass(frozen=True)
 class StreamingConfig:
     asr_agreement_depth: int = 2
     mt_agreement_depth: int = 2
     min_source_growth_chars: int = 2
     tts_min_phrase_chars: int = 8
+    tts_prebuffer_ms: int = 400
     queue_capacity: int = 6
     recent_context_turns: int = 3
     semantic_hard_timeout_ms: int = 1_800
@@ -139,6 +193,8 @@ class AppConfig:
     mt: ServiceConfig
     tts: TTSConfig
     audio: AudioConfig
+    vad: VADConfig
+    speaker_change: SpeakerChangeConfig
     streaming: StreamingConfig
     endpoint: EndpointConfig
     voice_clone: VoiceCloneConfig
@@ -164,12 +220,54 @@ class AppConfig:
             raise ConfigurationError("partial_interval_ms must be at least one frame")
         if self.audio.min_speech_ms > self.audio.max_turn_ms:
             raise ConfigurationError("min_speech_ms cannot exceed max_turn_ms")
+        if self.vad.provider not in {"energy", "sherpa_silero", "sherpa_ten"}:
+            raise ConfigurationError(
+                "vad.provider must be energy, sherpa_silero, or sherpa_ten"
+            )
+        if self.vad.provider != "energy" and not self.vad.model_path.strip():
+            raise ConfigurationError("vad.model_path is required for neural VAD")
+        if not 0 < self.vad.threshold < 1:
+            raise ConfigurationError("vad.threshold must be between 0 and 1")
+        if self.vad.min_speech_ms < 0 or self.vad.min_silence_ms < 0:
+            raise ConfigurationError("VAD speech/silence durations cannot be negative")
+        if self.vad.num_threads < 1:
+            raise ConfigurationError("vad.num_threads must be positive")
+        if self.speaker_change.provider not in {"sherpa_onnx"}:
+            raise ConfigurationError(
+                "speaker_change.provider must be sherpa_onnx"
+            )
+        if self.speaker_change.enabled:
+            if not self.speaker_change.model_path.strip():
+                raise ConfigurationError(
+                    "speaker_change.model_path is required when enabled"
+                )
+            if self.speaker_change.min_compare_ms < 1_000:
+                raise ConfigurationError(
+                    "speaker_change.min_compare_ms must be at least 1000 ms"
+                )
+            if not (
+                0 <= self.speaker_change.change_threshold
+                < self.speaker_change.same_threshold <= 1
+            ):
+                raise ConfigurationError(
+                    "speaker thresholds must satisfy 0 <= change < same <= 1"
+                )
+            if self.speaker_change.confirmation_windows < 1:
+                raise ConfigurationError(
+                    "speaker_change.confirmation_windows must be positive"
+                )
+            if not 0 <= self.speaker_change.reference_update_alpha <= 1:
+                raise ConfigurationError(
+                    "speaker_change.reference_update_alpha must be between 0 and 1"
+                )
         if self.streaming.asr_agreement_depth < 1:
             raise ConfigurationError("asr_agreement_depth must be positive")
         if self.streaming.mt_agreement_depth < 1:
             raise ConfigurationError("mt_agreement_depth must be positive")
         if self.streaming.queue_capacity < 1:
             raise ConfigurationError("queue_capacity must be positive")
+        if self.streaming.tts_prebuffer_ms < 0:
+            raise ConfigurationError("tts_prebuffer_ms cannot be negative")
         if self.streaming.semantic_hard_timeout_ms < self.audio.end_silence_ms:
             raise ConfigurationError(
                 "semantic_hard_timeout_ms must be >= audio.end_silence_ms"
@@ -222,6 +320,16 @@ class AppConfig:
                 )
             if self.tts.provider != "mock":
                 _validate_cloud_service("tts", self.tts)
+                if not 0.5 <= self.tts.speech_rate <= 2.0:
+                    raise ConfigurationError(
+                        "tts.speech_rate must be between 0.5 and 2.0"
+                    )
+                if "-realtime" in self.tts.model:
+                    parsed_ws = urlsplit(self.tts.normalized_websocket_url)
+                    if parsed_ws.scheme != "wss" or not parsed_ws.hostname:
+                        raise ConfigurationError(
+                            "tts.websocket_url must use a remote wss:// endpoint"
+                        )
             if self.voice_clone.enabled and not self.voice_clone.consent_confirmed:
                 raise ConfigurationError(
                     "voice cloning needs explicit speaker consent; pass "
@@ -348,6 +456,8 @@ def load_config(path: Path) -> AppConfig:
             mt=_service(raw, "mt"),
             tts=_tts(raw),
             audio=AudioConfig(**_section(raw, "audio")),
+            vad=VADConfig(**_section(raw, "vad")),
+            speaker_change=SpeakerChangeConfig(**_section(raw, "speaker_change")),
             streaming=StreamingConfig(**_section(raw, "streaming")),
             endpoint=EndpointConfig(**_section(raw, "endpoint")),
             voice_clone=VoiceCloneConfig(**_section(raw, "voice_clone")),

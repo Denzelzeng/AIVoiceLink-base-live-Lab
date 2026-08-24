@@ -27,7 +27,7 @@ send_language = false
 [tts]
 provider = "dashscope_qwen_voice_clone"
 base_url = "env:WORKSPACE_API_BASE_URL"
-model = "qwen3-tts-vc-2026-01-22"
+model = "qwen3-tts-vc-realtime-2026-01-15"
 api_key_env = "DASHSCOPE_API_KEY"
 timeout_seconds = 60.0
 max_tokens = 1
@@ -39,6 +39,8 @@ speech_path = "/api/v1/services/aigc/multimodal-generation/generation"
 sample_rate = 24000
 response_format = "pcm"
 fallback_voice = ""
+websocket_url = "auto"
+speech_rate = 1.3
 
 [audio]
 sample_rate = 24000
@@ -49,15 +51,44 @@ energy_threshold = 350
 calibration_seconds = 1.0
 pre_roll_ms = 200
 min_speech_ms = 300
-end_silence_ms = 450
+# Silero itself keeps 100 ms silence; the outer 300 ms debounce gives an
+# effective candidate pause around 400 ms before semantic endpointing.
+end_silence_ms = 300
 partial_interval_ms = 1200
 max_turn_ms = 10000
+
+[vad]
+# Silero runs locally through sherpa-onnx. It detects acoustic speech only;
+# [endpoint] below remains responsible for semantic turn completion.
+provider = "sherpa_silero"
+model_path = "../models/silero_vad.onnx"
+inference_provider = "cpu"
+threshold = 0.5
+min_speech_ms = 150
+min_silence_ms = 100
+num_threads = 1
+
+[speaker_change]
+# Compare local CAM++ embeddings before creating another cloud cloned voice.
+enabled = true
+provider = "sherpa_onnx"
+model_path = "../models/campplus_zh_en.onnx"
+inference_provider = "cpu"
+num_threads = 2
+min_compare_ms = 2000
+same_threshold = 0.72
+change_threshold = 0.55
+confirmation_windows = 1
+reference_update_alpha = 0.10
 
 [streaming]
 asr_agreement_depth = 2
 mt_agreement_depth = 2
 min_source_growth_chars = 2
 tts_min_phrase_chars = 8
+# Buffer a small amount of each cloud response before speaker playback. This
+# trades 400 ms startup latency for smoother audio during network jitter.
+tts_prebuffer_ms = 400
 queue_capacity = 6
 recent_context_turns = 3
 semantic_hard_timeout_ms = 1800

@@ -11,10 +11,12 @@ requires-python = ">=3.11"
 dependencies = [
   "httpx>=0.28,<1",
   "python-dotenv>=1.0,<2",
+  "websockets>=15,<17",
 ]
 
 [project.optional-dependencies]
 audio = ["PyAudio>=0.2.14,<0.3"]
+local-audio = ["sherpa-onnx>=1.13.6,<1.14"]
 
 [project.scripts]
 simultrans = "simultrans_baseline.cli:main"

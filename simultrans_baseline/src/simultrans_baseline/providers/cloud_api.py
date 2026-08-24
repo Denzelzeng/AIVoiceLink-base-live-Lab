@@ -4,11 +4,14 @@ import asyncio
 import base64
 import io
 import json
+import uuid
 import wave
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
+from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import httpx
+import websockets
 
 from ..audio import pcm_to_wav
 from ..config import ServiceConfig, TTSConfig
@@ -258,6 +261,7 @@ class DashScopeVoiceCloneTTS:
         config: TTSConfig,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
+        ws_connect=None,
     ):
         self.config = config
         self._http = httpx.AsyncClient(
@@ -265,6 +269,55 @@ class DashScopeVoiceCloneTTS:
             timeout=_timeout(config.timeout_seconds),
             transport=transport,
         )
+        self._ws_connect = ws_connect or websockets.connect
+        self._realtime_socket = None
+        self._realtime_connection = None
+        self._realtime_connect_lock = asyncio.Lock()
+        self._realtime_synthesis_lock = asyncio.Lock()
+        self._realtime_prepare_lock = asyncio.Lock()
+        self._realtime_session_key: tuple[str, str, float] | None = None
+        self._prepared_realtime_sessions: dict[
+            tuple[str, str, float], tuple[object, object]
+        ] = {}
+        self._retired_realtime_tasks: set[asyncio.Task[None]] = set()
+
+    async def warmup(self) -> None:
+        """Open the reusable realtime socket while microphone capture starts."""
+        if "-realtime" not in self.config.model:
+            return
+        try:
+            await self._ensure_realtime_socket()
+        except Exception:
+            # Synthesis retries the connection and reports a normal TTS failure
+            # if the provider is still unavailable.
+            await self._close_realtime_socket(send_finish=False)
+
+    async def prepare_voice(self, profile_id: str, *, language: str) -> None:
+        """Make a cloned voice session ready before it becomes active."""
+        if "-realtime" not in self.config.model:
+            return
+        session_key = self._session_key(profile_id, language)
+        async with self._realtime_prepare_lock:
+            if (
+                session_key == self._realtime_session_key
+                or session_key in self._prepared_realtime_sessions
+            ):
+                return
+
+            # The startup socket has no active voice and can be configured in
+            # place.  A refresh is different: open/configure a second socket
+            # without taking the synthesis lock, so the old voice can keep
+            # feeding PCM to the FIFO while the replacement handshakes.
+            if self._realtime_session_key is None:
+                async with self._realtime_synthesis_lock:
+                    await self._prepare_realtime_session_locked(session_key)
+                return
+
+            prepared = await self._open_configured_realtime_session(session_key)
+            previous = self._prepared_realtime_sessions.pop(session_key, None)
+            self._prepared_realtime_sessions[session_key] = prepared
+            if previous is not None:
+                self._retire_realtime_session(*previous, send_finish=True)
 
     def _url(self, path: str) -> str:
         return f"{self.config.normalized_base_url}{path}"
@@ -320,6 +373,14 @@ class DashScopeVoiceCloneTTS:
         voice = profile_id or self.config.fallback_voice
         if not voice:
             raise ProviderError("no cloned or fallback TTS voice is available")
+        if "-realtime" in self.config.model:
+            async for chunk in self._synthesize_realtime(
+                text,
+                language=language,
+                voice=voice,
+            ):
+                yield chunk
+            return
         input_data: dict[str, object] = {"text": text, "voice": voice}
         if language.strip():
             input_data["language_type"] = language.strip()
@@ -357,6 +418,281 @@ class DashScopeVoiceCloneTTS:
                     raise ProviderError("TTS returned an odd number of PCM bytes")
                 if pcm:
                     yield AudioChunk(data=pcm, sample_rate=self.config.sample_rate)
+
+    async def _synthesize_realtime(
+        self,
+        text: str,
+        *,
+        language: str,
+        voice: str,
+    ) -> AsyncIterator[AudioChunk]:
+        emitted_audio = False
+        for attempt in range(2):
+            try:
+                async for chunk in self._synthesize_realtime_once(
+                    text,
+                    language=language,
+                    voice=voice,
+                ):
+                    emitted_audio = True
+                    yield chunk
+                return
+            except Exception:
+                await self._close_realtime_socket(send_finish=False)
+                if attempt == 0 and not emitted_audio:
+                    continue
+                raise
+
+    async def _synthesize_realtime_once(
+        self,
+        text: str,
+        *,
+        language: str,
+        voice: str,
+    ) -> AsyncIterator[AudioChunk]:
+        timeout = self.config.timeout_seconds
+        async with self._realtime_synthesis_lock:
+            session_key = self._session_key(voice, language)
+            socket = await self._prepare_realtime_session_locked(session_key)
+            await socket.send(
+                json.dumps(
+                    {
+                        "event_id": f"event_{uuid.uuid4().hex}",
+                        "type": "input_text_buffer.append",
+                        "text": text,
+                    }
+                )
+            )
+            await socket.send(
+                json.dumps(
+                    {
+                        "event_id": f"event_{uuid.uuid4().hex}",
+                        "type": "input_text_buffer.commit",
+                    }
+                )
+            )
+            while True:
+                event = await self._receive_ws_event(socket, timeout)
+                event_type = event.get("type")
+                if event_type == "response.audio.delta":
+                    encoded = event.get("delta", "")
+                    try:
+                        pcm = base64.b64decode(encoded, validate=True)
+                    except (ValueError, TypeError) as exc:
+                        raise ProviderError("invalid realtime TTS audio event") from exc
+                    if len(pcm) % 2:
+                        raise ProviderError(
+                            "realtime TTS returned an odd number of PCM bytes"
+                        )
+                    if pcm:
+                        yield AudioChunk(data=pcm, sample_rate=self.config.sample_rate)
+                elif event_type == "response.done":
+                    return
+
+    def _session_key(self, voice: str, language: str) -> tuple[str, str, float]:
+        return (voice, language or "Auto", self.config.speech_rate)
+
+    async def _prepare_realtime_session_locked(
+        self,
+        session_key: tuple[str, str, float],
+    ):
+        voice, language, speech_rate = session_key
+        # Qwen Realtime allows session.update only before synthesis starts.
+        # A cloned voice change therefore needs a fresh WebSocket session.
+        if (
+            self._realtime_session_key is not None
+            and session_key != self._realtime_session_key
+        ):
+            prepared = self._prepared_realtime_sessions.pop(session_key, None)
+            if prepared is not None:
+                old_socket = self._realtime_socket
+                old_connection = self._realtime_connection
+                self._realtime_socket, self._realtime_connection = prepared
+                self._realtime_session_key = session_key
+                if old_socket is not None or old_connection is not None:
+                    self._retire_realtime_session(
+                        old_socket,
+                        old_connection,
+                        send_finish=True,
+                    )
+                return self._realtime_socket
+            await self._close_realtime_socket(send_finish=True)
+        socket = await self._ensure_realtime_socket()
+        if session_key == self._realtime_session_key:
+            return socket
+        await self._configure_realtime_socket(socket, session_key)
+        self._realtime_session_key = session_key
+        return socket
+
+    async def _open_configured_realtime_session(
+        self,
+        session_key: tuple[str, str, float],
+    ) -> tuple[object, object]:
+        last_error: Exception | None = None
+        for _ in range(2):
+            socket = None
+            connection = None
+            try:
+                socket, connection = await self._open_realtime_socket()
+                await self._configure_realtime_socket(socket, session_key)
+                return socket, connection
+            except asyncio.CancelledError:
+                if socket is not None or connection is not None:
+                    await self._close_realtime_session(
+                        socket, connection, send_finish=False
+                    )
+                raise
+            except Exception as exc:
+                last_error = exc
+                if socket is not None or connection is not None:
+                    await self._close_realtime_session(
+                        socket, connection, send_finish=False
+                    )
+        assert last_error is not None
+        raise last_error
+
+    async def _configure_realtime_socket(
+        self,
+        socket,
+        session_key: tuple[str, str, float],
+    ) -> None:
+        voice, language, speech_rate = session_key
+        await socket.send(
+            json.dumps(
+                {
+                    "event_id": f"event_{uuid.uuid4().hex}",
+                    "type": "session.update",
+                    "session": {
+                        "voice": voice,
+                        "mode": "commit",
+                        "language_type": language,
+                        "response_format": "pcm",
+                        "sample_rate": self.config.sample_rate,
+                        "speech_rate": speech_rate,
+                    },
+                }
+            )
+        )
+        await self._wait_for_ws_event(
+            socket,
+            "session.updated",
+            self.config.timeout_seconds,
+        )
+
+    async def _ensure_realtime_socket(self):
+        if self._realtime_socket is not None:
+            return self._realtime_socket
+        async with self._realtime_connect_lock:
+            if self._realtime_socket is not None:
+                return self._realtime_socket
+            socket, connection = await self._open_realtime_socket()
+            self._realtime_connection = connection
+            self._realtime_socket = socket
+            return socket
+
+    async def _open_realtime_socket(self) -> tuple[object, object]:
+        key = self.config.api_key()
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
+        timeout = self.config.timeout_seconds
+        connection = self._ws_connect(
+            self._realtime_url(),
+            additional_headers=headers,
+            open_timeout=min(10.0, timeout),
+            close_timeout=min(10.0, timeout),
+        )
+        try:
+            socket = await connection.__aenter__()
+            await self._wait_for_ws_event(socket, "session.created", timeout)
+        except BaseException:
+            try:
+                await connection.__aexit__(None, None, None)
+            except Exception:
+                pass
+            raise
+        return socket, connection
+
+    async def _close_realtime_socket(self, *, send_finish: bool) -> None:
+        socket = self._realtime_socket
+        connection = self._realtime_connection
+        self._realtime_socket = None
+        self._realtime_connection = None
+        self._realtime_session_key = None
+        await self._close_realtime_session(socket, connection, send_finish=send_finish)
+
+    async def _close_realtime_session(
+        self,
+        socket,
+        connection,
+        *,
+        send_finish: bool,
+    ) -> None:
+        if socket is not None and send_finish:
+            try:
+                await socket.send(
+                    json.dumps(
+                        {
+                            "event_id": f"event_{uuid.uuid4().hex}",
+                            "type": "session.finish",
+                        }
+                    )
+                )
+            except Exception:
+                pass
+        if connection is not None:
+            try:
+                await connection.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+    def _retire_realtime_session(
+        self,
+        socket,
+        connection,
+        *,
+        send_finish: bool,
+    ) -> None:
+        task = asyncio.create_task(
+            self._close_realtime_session(
+                socket,
+                connection,
+                send_finish=send_finish,
+            )
+        )
+        self._retired_realtime_tasks.add(task)
+        task.add_done_callback(self._retired_realtime_tasks.discard)
+
+    async def _wait_for_ws_event(self, socket, expected: str, timeout: float) -> dict:
+        while True:
+            event = await self._receive_ws_event(socket, timeout)
+            if event.get("type") == expected:
+                return event
+
+    @staticmethod
+    async def _receive_ws_event(socket, timeout: float) -> dict:
+        try:
+            raw = await asyncio.wait_for(socket.recv(), timeout=timeout)
+            event = json.loads(raw)
+        except asyncio.TimeoutError as exc:
+            raise ProviderError("realtime TTS WebSocket timed out") from exc
+        except (ValueError, TypeError) as exc:
+            raise ProviderError("realtime TTS returned invalid JSON") from exc
+        if not isinstance(event, dict):
+            raise ProviderError("realtime TTS event must be a JSON object")
+        if event.get("type") == "error":
+            error = event.get("error", {})
+            if isinstance(error, dict):
+                detail = error.get("message") or error.get("code") or error
+            else:
+                detail = error
+            raise ProviderError(f"realtime TTS failed: {detail}")
+        return event
+
+    def _realtime_url(self) -> str:
+        parsed = urlsplit(self.config.normalized_websocket_url)
+        query = parsed.query
+        model_query = urlencode({"model": self.config.model})
+        query = f"{query}&{model_query}" if query else model_query
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
 
     async def _decode_complete_tts(self, body: bytes) -> AsyncIterator[AudioChunk]:
         try:
@@ -405,13 +741,46 @@ class DashScopeVoiceCloneTTS:
             },
         )
         _raise(response, "voice API health")
-        return {
+        result: dict[str, object] = {
             "provider": "dashscope_qwen_voice_clone",
             "configured_model": self.config.model,
             "api_reachable": True,
         }
+        if "-realtime" in self.config.model:
+            key = self.config.api_key()
+            headers = {"Authorization": f"Bearer {key}"} if key else {}
+            timeout = min(10.0, self.config.timeout_seconds)
+            async with self._ws_connect(
+                self._realtime_url(),
+                additional_headers=headers,
+                open_timeout=timeout,
+                close_timeout=timeout,
+            ) as socket:
+                await self._wait_for_ws_event(socket, "session.created", timeout)
+            result["websocket_reachable"] = True
+        return result
 
     async def aclose(self) -> None:
+        await self._close_realtime_socket(send_finish=True)
+        prepared = tuple(self._prepared_realtime_sessions.values())
+        self._prepared_realtime_sessions.clear()
+        if prepared:
+            await asyncio.gather(
+                *(
+                    self._close_realtime_session(
+                        socket,
+                        connection,
+                        send_finish=True,
+                    )
+                    for socket, connection in prepared
+                ),
+                return_exceptions=True,
+            )
+        if self._retired_realtime_tasks:
+            await asyncio.gather(
+                *tuple(self._retired_realtime_tasks),
+                return_exceptions=True,
+            )
         await self._http.aclose()
 
 

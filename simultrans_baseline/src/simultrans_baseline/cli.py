@@ -19,7 +19,9 @@ from .providers.cloud_api import (
     QwenMTTranslator,
 )
 from .render import ConsoleRenderer, EventFanout, JsonlRecorder
+from .speaker import build_speaker_change_detector
 from .sinks import NullAudioSink, PyAudioSink, WavDirectorySink
+from .vad import build_speech_detector
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -210,6 +212,18 @@ async def _run_pipeline(args: argparse.Namespace, *, demo: bool = False) -> int:
             voice_consent=args.voice_consent,
         )
     asr, translator, endpoint, tts = _build_services(config)
+    speech_detector = build_speech_detector(
+        config.vad,
+        config_path=config.source_path,
+    )
+    speaker_change_detector = (
+        build_speaker_change_detector(
+            config.speaker_change,
+            config_path=config.source_path,
+        )
+        if config.session.audio_output and config.voice_clone.enabled
+        else None
+    )
     if config.session.audio_output:
         if args.save_audio_dir:
             sink = WavDirectorySink(args.save_audio_dir)
@@ -228,6 +242,7 @@ async def _run_pipeline(args: argparse.Namespace, *, demo: bool = False) -> int:
         tts=tts,
         audio_sink=sink,
         event_handler=handler,
+        speaker_change_detector=speaker_change_detector,
     )
     if demo:
         source = _DemoSource(pipeline.on_speech_started)
@@ -236,6 +251,7 @@ async def _run_pipeline(args: argparse.Namespace, *, demo: bool = False) -> int:
             args.wav,
             config.audio,
             real_time=not args.no_realtime,
+            speech_detector=speech_detector,
             on_speech_started=pipeline.on_speech_started,
         )
     else:
@@ -253,12 +269,16 @@ async def _run_pipeline(args: argparse.Namespace, *, demo: bool = False) -> int:
                     "译音播放链路独立：继续讲话不会暂停或取消已排队的翻译语音；"
                     "建议使用耳机避免扬声器回声进入麦克风。"
                 )
+            if speaker_change_detector is not None:
+                print("本地说话人比对已启用：只有确认换人后才注册新的克隆音色。")
         source = MicrophoneWindowSource(
             config.audio,
             input_device_index=args.device_index,
+            speech_detector=speech_detector,
             on_speech_started=pipeline.on_speech_started,
             on_ready=lambda threshold: print(
-                f"[麦克风] 校准完成（VAD 阈值 {threshold}），现在可以开始讲话。"
+                f"[麦克风] 校准完成（噪声基线 {threshold}；"
+                f"VAD={config.vad.provider}），现在可以开始讲话。"
             ),
         )
     try:
@@ -291,6 +311,27 @@ class _DemoSource:
 
 async def _doctor(args: argparse.Namespace) -> int:
     config = _load_from_args(args)
+    local_failed = False
+    try:
+        detector = build_speech_detector(
+            config.vad,
+            config_path=config.source_path,
+        )
+        label = type(detector).__name__ if detector is not None else "energy"
+        print(f"[ OK ] Local VAD: {label}")
+    except Exception as exc:
+        local_failed = True
+        print(f"[FAIL] Local VAD: {exc}")
+    if config.speaker_change.enabled and config.session.audio_output:
+        try:
+            speaker = build_speaker_change_detector(
+                config.speaker_change,
+                config_path=config.source_path,
+            )
+            print(f"[ OK ] Speaker change: {type(speaker).__name__}")
+        except Exception as exc:
+            local_failed = True
+            print(f"[FAIL] Speaker change: {exc}")
     asr, translator, endpoint, tts = _build_services(config)
     checks = [
         ("ASR", asr.health()),
@@ -302,7 +343,7 @@ async def _doctor(args: argparse.Namespace) -> int:
     results = await asyncio.gather(
         *(check for _, check in checks), return_exceptions=True
     )
-    failed = False
+    failed = local_failed
     for (label, _), result in zip(checks, results, strict=True):
         if isinstance(result, Exception):
             failed = True

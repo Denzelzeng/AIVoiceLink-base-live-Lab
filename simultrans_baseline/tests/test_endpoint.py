@@ -65,7 +65,28 @@ class EndpointTests(unittest.IsolatedAsyncioTestCase):
             window, transcript="天气很好。", language="Chinese"
         )
         self.assertTrue(decision.complete)
-        self.assertIn("fallback", decision.reason)
+        self.assertIn("fast path", decision.reason)
+
+    async def test_terminal_punctuation_skips_remote_semantic_round_trip(self) -> None:
+        calls = 0
+
+        class Primary:
+            async def classify(self, *args, **kwargs):
+                nonlocal calls
+                calls += 1
+                raise AssertionError("terminal punctuation should be local")
+
+            async def aclose(self):
+                return None
+
+        endpoint = FallbackSemanticEndpoint(Primary())
+        window = AudioWindow(1, b"\0\0" * 1600, 16000, True, 0.0, 1.0)
+        for transcript in ("嗯。", "这一段写在哪里？", "完成了！"):
+            decision = await endpoint.classify(
+                window, transcript=transcript, language="Chinese"
+            )
+            self.assertTrue(decision.complete)
+        self.assertEqual(calls, 0)
 
 
 if __name__ == "__main__":

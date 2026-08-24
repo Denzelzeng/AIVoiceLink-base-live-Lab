@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from .config import VoiceCloneConfig
 from .contracts import CloningTTSBackend, EventHandler
 from .events import AudioWindow, PipelineEvent, VoiceProfile
+from .speaker import SpeakerChangeDetector, SpeakerDecision
 
 
 @dataclass
@@ -19,12 +20,12 @@ class _TurnReference:
 
 
 class VoiceEnrollmentManager:
-    """Continuously refresh cloned voices from new, sufficiently long turns.
+    """Enroll cloned voices, refreshing only after a confirmed speaker change.
 
     The first profile may bootstrap from several short turns so startup TTS is
-    not lost. Once ready, every logical turn containing enough clean speech
-    receives its own asynchronously enrolled profile. TTS can then wait for
-    the profile belonging to that turn instead of reusing one voice forever.
+    not lost.  Subsequent references pass through an independent local speaker
+    comparison gate. Only startup waits for enrollment; a confirmed refresh
+    never blocks TTS and takes effect on later work.
     """
 
     def __init__(
@@ -34,13 +35,17 @@ class VoiceEnrollmentManager:
         *,
         session_id: str,
         source_language: str,
+        target_language: str,
         emit: EventHandler,
+        speaker_change_detector: SpeakerChangeDetector | None = None,
     ):
         self.backend = backend
         self.config = config
         self.session_id = session_id
         self.source_language = source_language
+        self.target_language = target_language
         self.emit = emit
+        self.speaker_change_detector = speaker_change_detector
         self.profile: VoiceProfile | None = None
         self.error: Exception | None = None
 
@@ -50,9 +55,13 @@ class VoiceEnrollmentManager:
         self._turn_decided: dict[int, asyncio.Event] = {}
         self._all_profiles: dict[str, VoiceProfile] = {}
         self._enrolled_turns: set[int] = set()
+        self._speaker_checked_turns: set[int] = set()
 
         self._bootstrap_pcm = bytearray()
         self._bootstrap_transcripts: OrderedDict[int, str] = OrderedDict()
+        self._bootstrap_checked_turns: set[int] = set()
+        self._bootstrap_accepted_turns: set[int] = set()
+        self._bootstrap_speaker_seeded = False
         self._bootstrap_started = False
         self._first_ready = asyncio.Event()
         self._sequence = 0
@@ -84,13 +93,23 @@ class VoiceEnrollmentManager:
         # Before any voice exists, several short utterances from the initial
         # speaker may jointly satisfy the provider's hard reference minimum.
         if not self.profile and not self._bootstrap_started:
-            if delta:
-                self._bootstrap_pcm.extend(delta)
-            if transcript.strip():
-                self._bootstrap_transcripts[voice_turn_id] = transcript.strip()
-            if self._duration_ms(self._bootstrap_pcm, window.sample_rate) >= (
-                self.config.min_reference_ms
-            ):
+            if self.speaker_change_detector is not None:
+                bootstrap_ready = await self._observe_gated_bootstrap(
+                    voice_turn_id,
+                    turn,
+                    delta,
+                    transcript,
+                )
+            else:
+                if delta:
+                    self._bootstrap_pcm.extend(delta)
+                if transcript.strip():
+                    self._bootstrap_transcripts[voice_turn_id] = transcript.strip()
+                bootstrap_ready = self._duration_ms(
+                    self._bootstrap_pcm,
+                    window.sample_rate,
+                ) >= self.config.min_reference_ms
+            if bootstrap_ready:
                 self._bootstrap_started = True
                 self._enrolled_turns.add(voice_turn_id)
                 await self._start_enrollment(
@@ -107,17 +126,25 @@ class VoiceEnrollmentManager:
             (self.profile or self._bootstrap_started)
             and self.config.refresh_enabled
             and voice_turn_id not in self._enrolled_turns
+            and voice_turn_id not in self._speaker_checked_turns
             and self._duration_ms(turn.pcm, window.sample_rate)
-            >= self.config.min_reference_ms
+            >= self._minimum_refresh_ms()
         ):
-            self._enrolled_turns.add(voice_turn_id)
-            await self._start_enrollment(
+            self._speaker_checked_turns.add(voice_turn_id)
+            should_enroll = await self._should_refresh(
                 voice_turn_id,
-                turn.pcm,
+                bytes(turn.pcm),
                 window.sample_rate,
-                " ".join(turn.transcripts.values()),
-                refresh=True,
             )
+            if should_enroll:
+                self._enrolled_turns.add(voice_turn_id)
+                await self._start_enrollment(
+                    voice_turn_id,
+                    turn.pcm,
+                    window.sample_rate,
+                    " ".join(turn.transcripts.values()),
+                    refresh=True,
+                )
             decision.set()
             return
 
@@ -135,12 +162,9 @@ class VoiceEnrollmentManager:
         *,
         refresh: bool,
     ) -> None:
-        max_bytes = round(
-            self.config.max_reference_ms / 1_000 * sample_rate * 2
-        )
         # Prefer recent speech so a changed speaker replaces the previous voice
         # as soon as one full provider-sized reference is available.
-        reference = bytes(pcm[-max_bytes:])
+        reference = self._trim_reference(pcm, sample_rate)
         reference_ms = self._duration_ms(reference, sample_rate)
         self._sequence += 1
         sequence = self._sequence
@@ -192,6 +216,29 @@ class VoiceEnrollmentManager:
                 reference_ms=reference_ms,
                 created_at=profile.created_at,
             )
+            prepare_voice = getattr(self.backend, "prepare_voice", None)
+            if callable(prepare_voice):
+                try:
+                    # Configure the replacement WebSocket before publishing the
+                    # profile.  While this awaits the synthesis lock, FIFO TTS
+                    # continues on the old, already-ready session.
+                    await prepare_voice(
+                        enrolled.profile_id,
+                        language=self.target_language,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # Prewarming is an optimization.  Keep the enrolled voice;
+                    # synthesize() retains its reconnect/retry path.
+                    await self._emit(
+                        PipelineEvent(
+                            kind="voice.prepare_failed",
+                            session_id=self.session_id,
+                            turn_id=voice_turn_id,
+                            data={"profile_id": enrolled.profile_id, "error": str(exc)},
+                        )
+                    )
             self._turn_profiles[voice_turn_id] = enrolled
             self._all_profiles[enrolled.profile_id] = enrolled
             if sequence >= self._active_sequence:
@@ -226,6 +273,12 @@ class VoiceEnrollmentManager:
             self._turn_decided.setdefault(voice_turn_id, asyncio.Event()).set()
 
     async def wait_for_profile(self, voice_turn_id: int) -> VoiceProfile | None:
+        # A refresh must never hold the FIFO TTS worker hostage.  Once the
+        # initial profile exists, synthesize immediately with the newest ready
+        # profile; an in-flight enrollment is applied only to later work.
+        if self.profile is not None:
+            return self.profile
+
         timeout = self.config.wait_timeout_ms / 1_000
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
@@ -283,6 +336,165 @@ class VoiceEnrollmentManager:
                             data={"profile_id": profile_id, "error": str(exc)},
                         )
                     )
+
+    async def _observe_gated_bootstrap(
+        self,
+        voice_turn_id: int,
+        turn: _TurnReference,
+        delta: bytes,
+        transcript: str,
+    ) -> bool:
+        assert self.speaker_change_detector is not None
+        sample_rate = turn.sample_rate
+
+        if voice_turn_id in self._bootstrap_accepted_turns:
+            if delta:
+                self._bootstrap_pcm.extend(delta)
+            if transcript.strip():
+                self._bootstrap_transcripts[voice_turn_id] = transcript.strip()
+            return self._duration_ms(
+                self._bootstrap_pcm,
+                sample_rate,
+            ) >= self.config.min_reference_ms
+
+        if voice_turn_id in self._bootstrap_checked_turns:
+            return False
+        if self._duration_ms(turn.pcm, sample_rate) < (
+            self.speaker_change_detector.config.min_compare_ms
+        ):
+            return False
+
+        self._bootstrap_checked_turns.add(voice_turn_id)
+        reference = self._trim_reference(turn.pcm, sample_rate)
+        accepted = False
+        try:
+            if not self._bootstrap_speaker_seeded:
+                await self.speaker_change_detector.seed(
+                    reference,
+                    sample_rate=sample_rate,
+                )
+                self._bootstrap_speaker_seeded = True
+                accepted = True
+                result_data = {
+                    "state": "initial",
+                    "changed": False,
+                    "similarity": None,
+                    "confirmations": 0,
+                }
+            else:
+                result = await self.speaker_change_detector.assess(
+                    reference,
+                    sample_rate=sample_rate,
+                )
+                result_data = self._speaker_event_data(result)
+                if result.changed:
+                    # The accumulated short references belonged to the prior
+                    # speaker. Start the provider-sized bootstrap over using
+                    # only the newly confirmed speaker.
+                    self._bootstrap_pcm.clear()
+                    self._bootstrap_transcripts.clear()
+                    self._bootstrap_accepted_turns.clear()
+                    accepted = True
+                elif result.state == "same":
+                    accepted = True
+
+            await self._emit(
+                PipelineEvent(
+                    kind="speaker.decision",
+                    session_id=self.session_id,
+                    turn_id=voice_turn_id,
+                    data=result_data,
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._emit(
+                PipelineEvent(
+                    kind="speaker.failed",
+                    session_id=self.session_id,
+                    turn_id=voice_turn_id,
+                    data={"error": str(exc), "stage": "bootstrap"},
+                )
+            )
+            return False
+
+        if not accepted:
+            return False
+        self._bootstrap_accepted_turns.add(voice_turn_id)
+        self._bootstrap_pcm.extend(turn.pcm)
+        if transcript.strip():
+            self._bootstrap_transcripts[voice_turn_id] = transcript.strip()
+        return self._duration_ms(
+            self._bootstrap_pcm,
+            sample_rate,
+        ) >= self.config.min_reference_ms
+
+    async def _should_refresh(
+        self,
+        voice_turn_id: int,
+        pcm: bytes,
+        sample_rate: int,
+    ) -> bool:
+        # With the detector disabled, preserve the old refresh-every-turn mode
+        # for mock/demo configurations and explicit compatibility use.
+        if self.speaker_change_detector is None:
+            return True
+
+        try:
+            result = await self.speaker_change_detector.assess(
+                self._trim_reference(pcm, sample_rate),
+                sample_rate=sample_rate,
+            )
+            await self._emit(
+                PipelineEvent(
+                    kind="speaker.decision",
+                    session_id=self.session_id,
+                    turn_id=voice_turn_id,
+                    data=self._speaker_event_data(result),
+                )
+            )
+            # If the first cloud enrollment failed, retry with a clean eligible
+            # reference even when the local embedding still says same speaker.
+            return result.changed or (self.profile is None and self.error is not None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Fail closed: keeping the current profile is preferable to
+            # repeatedly creating cloud voices when local comparison is down.
+            await self._emit(
+                PipelineEvent(
+                    kind="speaker.failed",
+                    session_id=self.session_id,
+                    turn_id=voice_turn_id,
+                    data={"error": str(exc), "stage": "compare"},
+                )
+            )
+            return False
+
+    @staticmethod
+    def _speaker_event_data(result: SpeakerDecision) -> dict[str, object]:
+        similarity = result.similarity
+        return {
+            "state": result.state,
+            "changed": result.changed,
+            "similarity": round(similarity, 4) if similarity is not None else None,
+            "confirmations": result.confirmations,
+        }
+
+    def _trim_reference(self, pcm: bytes | bytearray, sample_rate: int) -> bytes:
+        max_bytes = round(
+            self.config.max_reference_ms / 1_000 * sample_rate * 2
+        )
+        return bytes(pcm[-max_bytes:])
+
+    def _minimum_refresh_ms(self) -> int:
+        if self.speaker_change_detector is None:
+            return self.config.min_reference_ms
+        return max(
+            self.config.min_reference_ms,
+            self.speaker_change_detector.config.min_compare_ms,
+        )
 
     @staticmethod
     def _duration_ms(pcm: bytes | bytearray, sample_rate: int) -> int:

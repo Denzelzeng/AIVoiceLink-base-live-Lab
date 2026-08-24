@@ -14,6 +14,7 @@ from typing import AsyncIterator
 
 from .config import AudioConfig
 from .events import AudioWindow
+from .vad import SpeechDetector
 
 
 def pcm_rms(pcm: bytes) -> int:
@@ -48,9 +49,16 @@ def pcm_to_wav(
 class EnergyTurnSegmenter:
     """Energy VAD that emits cumulative partial windows and a final window."""
 
-    def __init__(self, config: AudioConfig, *, energy_threshold: int | None = None):
+    def __init__(
+        self,
+        config: AudioConfig,
+        *,
+        energy_threshold: int | None = None,
+        speech_detector: SpeechDetector | None = None,
+    ):
         self.config = config
         self.energy_threshold = energy_threshold or config.energy_threshold
+        self.speech_detector = speech_detector
         self._pre_roll: deque[bytes] = deque(
             maxlen=max(1, config.pre_roll_ms // config.frame_ms)
         )
@@ -66,7 +74,14 @@ class EnergyTurnSegmenter:
 
     def add_frame(self, frame: bytes, *, captured_at: float | None = None) -> list[AudioWindow]:
         captured = time.monotonic() if captured_at is None else captured_at
-        voiced = pcm_rms(frame) >= self.energy_threshold
+        voiced = (
+            self.speech_detector.is_speech(
+                frame,
+                sample_rate=self.config.sample_rate,
+            )
+            if self.speech_detector is not None
+            else pcm_rms(frame) >= self.energy_threshold
+        )
         if not self._active:
             self._pre_roll.append(frame)
             if not voiced:
@@ -169,11 +184,13 @@ class WavWindowSource:
         config: AudioConfig,
         *,
         real_time: bool = True,
+        speech_detector: SpeechDetector | None = None,
         on_speech_started: Callable[[], Awaitable[None] | None] | None = None,
     ):
         self.path = path.resolve()
         self.config = config
         self.real_time = real_time
+        self.speech_detector = speech_detector
         self.on_speech_started = on_speech_started
 
     async def __aiter__(self) -> AsyncIterator[AudioWindow]:
@@ -194,7 +211,10 @@ class WavWindowSource:
                     "signed 16-bit PCM; "
                     f"got rate={actual[0]}, channels={actual[1]}, width={actual[2]}"
                 )
-            segmenter = EnergyTurnSegmenter(self.config)
+            segmenter = EnergyTurnSegmenter(
+                self.config,
+                speech_detector=self.speech_detector,
+            )
             while True:
                 frame = stream.readframes(self.config.frames_per_buffer)
                 if not frame:
@@ -223,11 +243,13 @@ class MicrophoneWindowSource:
         config: AudioConfig,
         *,
         input_device_index: int | None = None,
+        speech_detector: SpeechDetector | None = None,
         on_speech_started: Callable[[], Awaitable[None] | None] | None = None,
         on_ready: Callable[[int], Awaitable[None] | None] | None = None,
     ):
         self.config = config
         self.input_device_index = input_device_index
+        self.speech_detector = speech_detector
         self.on_speech_started = on_speech_started
         self.on_ready = on_ready
 
@@ -250,7 +272,11 @@ class MicrophoneWindowSource:
                 frames_per_buffer=self.config.frames_per_buffer,
             )
             threshold = await self._calibrate(stream)
-            segmenter = EnergyTurnSegmenter(self.config, energy_threshold=threshold)
+            segmenter = EnergyTurnSegmenter(
+                self.config,
+                energy_threshold=threshold,
+                speech_detector=self.speech_detector,
+            )
             if self.on_ready:
                 result = self.on_ready(threshold)
                 if asyncio.iscoroutine(result):

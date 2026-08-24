@@ -175,17 +175,23 @@ class FallbackSemanticEndpoint:
         transcript: str,
         language: str,
     ) -> EndpointDecision:
+        local = await self.fallback.classify(
+            window, transcript=transcript, language=language
+        )
+        if local.complete and local.reason == "terminal punctuation":
+            return EndpointDecision(
+                True,
+                local.probability,
+                "terminal punctuation fast path",
+            )
         try:
             return await self.primary.classify(
                 window, transcript=transcript, language=language
             )
         except Exception as exc:
-            fallback = await self.fallback.classify(
-                window, transcript=transcript, language=language
-            )
             return EndpointDecision(
-                fallback.complete,
-                fallback.probability,
+                local.complete,
+                local.probability,
                 f"heuristic fallback after semantic API error: {exc}",
             )
 

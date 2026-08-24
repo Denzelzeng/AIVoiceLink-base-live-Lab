@@ -3,12 +3,12 @@
 ## 职责分工
 
 ```text
-AEC/NS -> energy gate -> 450 ms silence candidate
+AEC/NS -> Silero VAD -> about 400 ms silence candidate
                      -> remote semantic LLM COMPLETE/INCOMPLETE
                      -> 1.8 s hard timeout
 ```
 
-- 能量 VAD 只判断 speech/non-speech，不做语义推理；
+- Silero VAD 只判断 speech/non-speech，不做语义推理；
 - 云端语义模型判断候选停顿是否结束完整语义；
 - LCP 决定句中哪些文字可以稳定提交；
 - hard timeout 防止连续 incomplete 导致永不结束；
@@ -16,9 +16,9 @@ AEC/NS -> energy gate -> 450 ms silence candidate
 
 ## 为什么 VAD 留在本地
 
-`EnergyTurnSegmenter` 是 RMS 门限、预卷和静音计时器，不是模型。它需要在每个 50 ms
-音频帧上运行，把这些帧全部发给云模型既增加网络成本，也会让打断依赖往返延迟。因此
-“所有模型走 API”与“本地无模型 VAD”并不冲突。
+`EnergyTurnSegmenter` 现在是可插拔切分器：默认接本地 Silero ONNX，保留 RMS 门限回退，
+并继续负责预卷和外层静音计时。它需要在每个 50 ms 音频帧上运行，把这些帧全部发给云
+模型既增加网络成本，也会让边界依赖往返延迟。
 
 默认语义端点只向 Qwen 文本 API 提交当前 ASR 转写。若返回 `INCOMPLETE`，下一声学段并入
 同一逻辑话轮。远端 API 故障时，标点和连接词 heuristic 只作为临时安全回退，并在事件
@@ -30,7 +30,7 @@ AEC/NS -> energy gate -> 450 ms silence candidate
 |---|---:|---|
 | capture sample rate | 24 kHz | 同时满足 Qwen 声音注册最低采样率 |
 | frame_ms | 50 ms | 越小越灵敏，调度开销越高 |
-| VAD candidate silence | 450 ms | 越短越易误切，越长句末延迟越大 |
+| VAD candidate silence | 100 ms 模型内 + 300 ms 外层 | 越短越易误切，越长句末延迟越大 |
 | ASR partial interval | 1200 ms | 越短累计 API 调用与费用越高 |
 | semantic API timeout | 4 s | 单次网络上限；正常目标应远低于此值 |
 | semantic hard timeout | 1800 ms | 连续 incomplete 后的本地强制结束 |

@@ -16,7 +16,8 @@ from .contracts import (
     SemanticEndpointBackend,
     TranslationBackend,
 )
-from .events import AudioWindow, PipelineEvent
+from .events import AudioChunk, AudioWindow, PipelineEvent
+from .speaker import SpeakerChangeDetector
 from .stability import AgreementCommitter, PhraseBuffer
 from .voice import VoiceEnrollmentManager
 
@@ -34,6 +35,18 @@ class _TTSWork:
     segment_id: str
     text: str
     playback_epoch: int
+    is_final: bool = False
+
+
+@dataclass(frozen=True)
+class _PlaybackWork:
+    turn_id: int
+    segment_id: str
+    text: str
+    chunk: AudioChunk | None
+    playback_epoch: int
+    is_first: bool = False
+    is_last: bool = False
     is_final: bool = False
 
 
@@ -61,6 +74,7 @@ class RealtimeInterpretationPipeline:
         tts: CloningTTSBackend | None,
         audio_sink: AudioSink,
         event_handler: EventHandler,
+        speaker_change_detector: SpeakerChangeDetector | None = None,
     ):
         self.config = config
         self.asr = asr
@@ -82,7 +96,9 @@ class RealtimeInterpretationPipeline:
                 config.voice_clone,
                 session_id=self.session_id,
                 source_language=config.session.source_language,
+                target_language=config.session.target_language,
                 emit=self._dispatch,
+                speaker_change_detector=speaker_change_detector,
             )
             if tts and config.session.audio_output and config.voice_clone.enabled
             else None
@@ -95,31 +111,64 @@ class RealtimeInterpretationPipeline:
         # Text/audio output is an independent chain.  Do not back-pressure ASR/MT
         # merely because speech is currently longer than synthesized playback.
         tts_queue: asyncio.Queue[_TTSWork | None] = asyncio.Queue()
+        playback_queue: asyncio.Queue[_PlaybackWork | None] = asyncio.Queue()
 
         await self._emit("session.started", data={
             "source_language": self.config.session.source_language,
             "target_language": self.config.session.target_language,
             "audio_output": self.config.session.audio_output,
             "voice_clone": bool(self._voice),
+            "tts_speech_rate": self.config.tts.speech_rate,
         })
+
+        warmup = getattr(self.tts, "warmup", None) if self.tts else None
+        warmup_task = (
+            asyncio.create_task(warmup()) if callable(warmup) else None
+        )
 
         producer = asyncio.create_task(self._produce_windows(source, window_queue))
         asr_worker = asyncio.create_task(self._asr_worker(window_queue, mt_queue))
         mt_worker = asyncio.create_task(self._mt_worker(mt_queue, tts_queue))
-        tts_worker = asyncio.create_task(self._tts_worker(tts_queue))
+        tts_worker = asyncio.create_task(
+            self._tts_worker(tts_queue, playback_queue)
+        )
+        playback_worker = asyncio.create_task(
+            self._playback_worker(playback_queue)
+        )
         try:
-            await asyncio.gather(producer, asr_worker, mt_worker, tts_worker)
+            await asyncio.gather(
+                producer,
+                asr_worker,
+                mt_worker,
+                tts_worker,
+                playback_worker,
+            )
             await self._emit("session.finished")
         except Exception as exc:
-            for task in (producer, asr_worker, mt_worker, tts_worker):
+            for task in (
+                producer,
+                asr_worker,
+                mt_worker,
+                tts_worker,
+                playback_worker,
+            ):
                 if not task.done():
                     task.cancel()
             await asyncio.gather(
-                producer, asr_worker, mt_worker, tts_worker, return_exceptions=True
+                producer,
+                asr_worker,
+                mt_worker,
+                tts_worker,
+                playback_worker,
+                return_exceptions=True,
             )
             await self._emit("pipeline.error", data={"error": str(exc)})
             raise
         finally:
+            if warmup_task:
+                if not warmup_task.done():
+                    warmup_task.cancel()
+                await asyncio.gather(warmup_task, return_exceptions=True)
             await self.aclose()
 
     async def on_speech_started(self) -> None:
@@ -477,137 +526,252 @@ class RealtimeInterpretationPipeline:
         finally:
             await tts_queue.put(None)
 
-    async def _tts_worker(self, queue: asyncio.Queue[_TTSWork | None]) -> None:
-        while True:
-            work = await queue.get()
-            if work is None:
-                return
-            if not work.text:
-                if work.is_final:
-                    await self._emit_turn_metrics(work.turn_id)
-                continue
-            if work.playback_epoch != self._playback_epoch:
-                await self._emit(
-                    "tts.cancelled",
-                    turn_id=work.turn_id,
-                    data={"segment_id": work.segment_id, "reason": "barge-in"},
-                )
-                if work.is_final:
-                    await self._emit_turn_metrics(work.turn_id)
-                continue
-            assert self.tts is not None
-            profile_id: str | None = None
-            if self._voice:
-                if self._voice.profile is None:
+    async def _tts_worker(
+        self,
+        queue: asyncio.Queue[_TTSWork | None],
+        playback_queue: asyncio.Queue[_PlaybackWork | None],
+    ) -> None:
+        try:
+            while True:
+                work = await queue.get()
+                if work is None:
+                    return
+                if not work.text:
+                    if work.is_final:
+                        await self._emit_turn_metrics(work.turn_id)
+                    continue
+                if work.playback_epoch != self._playback_epoch:
                     await self._emit(
-                        "tts.waiting_for_voice",
+                        "tts.cancelled",
                         turn_id=work.turn_id,
-                        data={
-                            "segment_id": work.segment_id,
-                            "timeout_ms": self.config.voice_clone.wait_timeout_ms,
-                        },
+                        data={"segment_id": work.segment_id, "reason": "barge-in"},
                     )
-                profile = await self._voice.wait_for_profile(work.turn_id)
-                profile_id = profile.profile_id if profile else None
-                if profile_id is None and self.config.voice_clone.fallback_policy == "skip":
+                    if work.is_final:
+                        await self._emit_turn_metrics(work.turn_id)
+                    continue
+                assert self.tts is not None
+                profile_id: str | None = None
+                if self._voice:
+                    if self._voice.profile is None:
+                        await self._emit(
+                            "tts.waiting_for_voice",
+                            turn_id=work.turn_id,
+                            data={
+                                "segment_id": work.segment_id,
+                                "timeout_ms": self.config.voice_clone.wait_timeout_ms,
+                            },
+                        )
+                    profile = await self._voice.wait_for_profile(work.turn_id)
+                    profile_id = profile.profile_id if profile else None
+                    if (
+                        profile_id is None
+                        and self.config.voice_clone.fallback_policy == "skip"
+                    ):
+                        await self._emit(
+                            "tts.skipped",
+                            turn_id=work.turn_id,
+                            data={
+                                "segment_id": work.segment_id,
+                                "reason": "cloned voice is not ready",
+                            },
+                        )
+                        if work.is_final:
+                            await self._emit_turn_metrics(work.turn_id)
+                        continue
+                if self.config.streaming.barge_in_enabled:
+                    await self._speech_idle.wait()
+                if work.playback_epoch != self._playback_epoch:
                     await self._emit(
-                        "tts.skipped",
+                        "tts.cancelled",
                         turn_id=work.turn_id,
                         data={
                             "segment_id": work.segment_id,
-                            "reason": "cloned voice is not ready",
+                            "reason": "barge-in while waiting",
                         },
                     )
                     if work.is_final:
                         await self._emit_turn_metrics(work.turn_id)
                     continue
-            if self.config.streaming.barge_in_enabled:
-                await self._speech_idle.wait()
+
+                first_chunk = True
+                cancelled_during_stream = False
+                prefetched: list[AudioChunk] = []
+                prefetched_ms = 0.0
+
+                async def enqueue_chunk(chunk: AudioChunk) -> None:
+                    nonlocal first_chunk
+                    await playback_queue.put(
+                        _PlaybackWork(
+                            turn_id=work.turn_id,
+                            segment_id=work.segment_id,
+                            text=work.text,
+                            chunk=chunk,
+                            playback_epoch=work.playback_epoch,
+                            is_first=first_chunk,
+                        )
+                    )
+                    first_chunk = False
+
+                try:
+                    timing = self._timing.setdefault(
+                        work.turn_id, {"audio_started": time.monotonic()}
+                    )
+                    timing.setdefault("tts_requested", time.monotonic())
+                    async for chunk in self.tts.synthesize(
+                        work.text,
+                        language=self.config.session.target_language,
+                        profile_id=profile_id,
+                    ):
+                        timing.setdefault("first_cloud_audio", time.monotonic())
+                        if work.playback_epoch != self._playback_epoch:
+                            await self._emit(
+                                "tts.cancelled",
+                                turn_id=work.turn_id,
+                                data={
+                                    "segment_id": work.segment_id,
+                                    "reason": "barge-in during synthesis",
+                                },
+                            )
+                            cancelled_during_stream = True
+                            break
+                        if (
+                            first_chunk
+                            and self.config.streaming.tts_prebuffer_ms > 0
+                        ):
+                            prefetched.append(chunk)
+                            frame_bytes = chunk.channels * chunk.sample_width
+                            prefetched_ms += (
+                                len(chunk.data)
+                                / frame_bytes
+                                / chunk.sample_rate
+                                * 1_000
+                            )
+                            if (
+                                prefetched_ms
+                                < self.config.streaming.tts_prebuffer_ms
+                            ):
+                                continue
+                            for buffered in prefetched:
+                                await enqueue_chunk(buffered)
+                            prefetched.clear()
+                        else:
+                            await enqueue_chunk(chunk)
+                    if not cancelled_during_stream:
+                        for buffered in prefetched:
+                            await enqueue_chunk(buffered)
+                        await playback_queue.put(
+                            _PlaybackWork(
+                                turn_id=work.turn_id,
+                                segment_id=work.segment_id,
+                                text=work.text,
+                                chunk=None,
+                                playback_epoch=work.playback_epoch,
+                                is_last=True,
+                                is_final=work.is_final,
+                            )
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    await self._emit(
+                        "tts.failed",
+                        turn_id=work.turn_id,
+                        data={
+                            "segment_id": work.segment_id,
+                            "error": str(exc),
+                        },
+                    )
+                    if work.is_final:
+                        await self._emit_turn_metrics(work.turn_id)
+                if cancelled_during_stream and work.is_final:
+                    await self._emit_turn_metrics(work.turn_id)
+        finally:
+            await playback_queue.put(None)
+
+    async def _playback_worker(
+        self,
+        queue: asyncio.Queue[_PlaybackWork | None],
+    ) -> None:
+        cancelled_segments: set[str] = set()
+        last_audio_ended_at: float | None = None
+        while True:
+            work = await queue.get()
+            if work is None:
+                self._playing = False
+                return
             if work.playback_epoch != self._playback_epoch:
+                if work.segment_id not in cancelled_segments:
+                    cancelled_segments.add(work.segment_id)
+                    await self._emit(
+                        "tts.cancelled",
+                        turn_id=work.turn_id,
+                        data={
+                            "segment_id": work.segment_id,
+                            "reason": "barge-in before playback",
+                        },
+                    )
+                if work.is_last and work.is_final:
+                    await self._emit_turn_metrics(work.turn_id)
+                continue
+            if work.is_last:
+                self._playing = False
                 await self._emit(
-                    "tts.cancelled",
+                    "tts.finished",
                     turn_id=work.turn_id,
-                    data={
-                        "segment_id": work.segment_id,
-                        "reason": "barge-in while waiting",
-                    },
+                    data={"segment_id": work.segment_id},
                 )
                 if work.is_final:
                     await self._emit_turn_metrics(work.turn_id)
                 continue
-            self._playing = True
-            first_chunk = True
-            cancelled_during_stream = False
-            try:
+            if work.chunk is None:
+                continue
+            if work.is_first:
+                self._playing = True
+                timing = self._timing.setdefault(
+                    work.turn_id, {"audio_started": time.monotonic()}
+                )
+                if last_audio_ended_at is not None:
+                    timing.setdefault(
+                        "playback_gap_ms",
+                        round((time.monotonic() - last_audio_ended_at) * 1_000, 1),
+                    )
+                timing.setdefault("first_audio", time.monotonic())
                 await self._emit(
                     "tts.started",
                     turn_id=work.turn_id,
                     data={
                         "segment_id": work.segment_id,
                         "text": work.text,
-                        "profile_id": profile_id,
                     },
                 )
-                async for chunk in self.tts.synthesize(
-                    work.text,
-                    language=self.config.session.target_language,
-                    profile_id=profile_id,
-                ):
-                    if work.playback_epoch != self._playback_epoch:
-                        await self._emit(
-                            "tts.cancelled",
-                            turn_id=work.turn_id,
-                            data={
-                                "segment_id": work.segment_id,
-                                "reason": "barge-in during synthesis",
-                            },
-                        )
-                        cancelled_during_stream = True
-                        break
-                    if first_chunk:
-                        timing = self._timing.setdefault(
-                            work.turn_id, {"audio_started": time.monotonic()}
-                        )
-                        timing.setdefault("first_audio", time.monotonic())
-                        first_chunk = False
-                    await self.audio_sink.write(chunk, segment_id=work.segment_id)
-                else:
-                    await self._emit(
-                        "tts.finished",
-                        turn_id=work.turn_id,
-                        data={"segment_id": work.segment_id},
-                    )
-                    if work.is_final:
-                        await self._emit_turn_metrics(work.turn_id)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                await self._emit(
-                    "tts.failed",
-                    turn_id=work.turn_id,
-                    data={
-                        "segment_id": work.segment_id,
-                        "error": str(exc),
-                    },
-                )
-                if work.is_final:
-                    await self._emit_turn_metrics(work.turn_id)
-            finally:
-                self._playing = False
-            if cancelled_during_stream and work.is_final:
-                await self._emit_turn_metrics(work.turn_id)
+            await self.audio_sink.write(work.chunk, segment_id=work.segment_id)
+            last_audio_ended_at = time.monotonic()
 
     async def _emit_turn_metrics(self, turn_id: int) -> None:
         timing = self._timing.get(turn_id, {})
         started = timing.get("audio_started")
         values: dict[str, float | None] = {}
-        for key in ("first_source_commit", "first_target_commit", "first_audio"):
+        for key in (
+            "first_source_commit",
+            "first_target_commit",
+            "tts_requested",
+            "first_cloud_audio",
+            "first_audio",
+        ):
             value = timing.get(key)
             values[f"{key}_ms"] = (
                 round((value - started) * 1_000, 1)
                 if value is not None and started is not None
                 else None
             )
+        cloud_audio = timing.get("first_cloud_audio")
+        first_audio = timing.get("first_audio")
+        values["playback_queue_ms"] = (
+            round((first_audio - cloud_audio) * 1_000, 1)
+            if first_audio is not None and cloud_audio is not None
+            else None
+        )
+        values["playback_gap_ms"] = timing.get("playback_gap_ms")
         await self._emit("turn.metrics", turn_id=turn_id, data=values)
 
     async def _emit(

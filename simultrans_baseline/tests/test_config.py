@@ -6,6 +6,7 @@ from pathlib import Path
 
 from simultrans_baseline.config import (
     ConfigurationError,
+    TTSConfig,
     _read_workspace_csv,
     _validate_cloud_url,
     _workspace_service_base_url,
@@ -13,6 +14,19 @@ from simultrans_baseline.config import (
 
 
 class ConfigTests(unittest.TestCase):
+    def test_derives_workspace_realtime_tts_websocket_url(self) -> None:
+        config = TTSConfig(
+            "dashscope_qwen_voice_clone",
+            "https://workspace.cn-beijing.maas.aliyuncs.com",
+            "qwen3-tts-vc-realtime-2026-01-15",
+            websocket_url="auto",
+            speech_rate=1.3,
+        )
+        self.assertEqual(
+            config.normalized_websocket_url,
+            "wss://workspace.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime",
+        )
+
     def test_reads_transposed_workspace_csv(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "workspace-apiKey.csv"

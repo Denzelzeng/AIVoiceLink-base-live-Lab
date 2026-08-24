@@ -1,7 +1,9 @@
 $ErrorActionPreference = 'Stop'
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$env:PYTHONPATH = Join-Path $projectRoot 'src'
+$sourcePath = Join-Path $projectRoot 'src'
+$vendorPath = Join-Path $projectRoot '.vendor'
+$env:PYTHONPATH = "$vendorPath;$sourcePath"
 $env:PYTHONUTF8 = '1'
 $env:PYTHONIOENCODING = 'utf-8'
 $pythonExe = 'D:\ProgramData\miniforge3\envs\aivoicelink\python.exe'

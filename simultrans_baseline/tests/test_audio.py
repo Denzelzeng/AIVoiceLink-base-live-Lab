@@ -5,6 +5,7 @@ import unittest
 
 from simultrans_baseline.audio import EnergyTurnSegmenter, pcm_to_wav
 from simultrans_baseline.config import AudioConfig
+from simultrans_baseline.vad import pcm16_as_float
 
 
 def frame(amplitude: int, samples: int = 800) -> bytes:
@@ -46,7 +47,31 @@ class AudioTests(unittest.TestCase):
             self.assertEqual(stream.getnchannels(), 1)
             self.assertEqual(stream.getsampwidth(), 2)
 
+    def test_pluggable_vad_overrides_energy_threshold(self) -> None:
+        class AlwaysSpeech:
+            def is_speech(self, pcm, *, sample_rate):
+                del pcm, sample_rate
+                return True
+
+        config = AudioConfig(
+            frame_ms=50,
+            pre_roll_ms=50,
+            min_speech_ms=100,
+            end_silence_ms=100,
+            partial_interval_ms=100,
+            max_turn_ms=150,
+            energy_threshold=30_000,
+            calibration_seconds=0,
+        )
+        segmenter = EnergyTurnSegmenter(config, speech_detector=AlwaysSpeech())
+        segmenter.add_frame(frame(1))
+        self.assertTrue(segmenter.consume_speech_started())
+
+    def test_pcm_resampling_preserves_duration(self) -> None:
+        pcm = frame(1000, samples=2_400)
+        values = pcm16_as_float(pcm, sample_rate=24_000)
+        self.assertEqual(len(values), 1_600)
+
 
 if __name__ == "__main__":
     unittest.main()
-

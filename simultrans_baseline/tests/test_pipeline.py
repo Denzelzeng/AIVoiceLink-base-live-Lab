@@ -6,7 +6,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from simultrans_baseline.config import apply_overrides, load_config
+from simultrans_baseline.config import SpeakerChangeConfig, apply_overrides, load_config
 from simultrans_baseline.endpoint import HeuristicSemanticEndpoint
 from simultrans_baseline.events import AudioChunk, AudioWindow, PipelineEvent
 from simultrans_baseline.pipeline import RealtimeInterpretationPipeline
@@ -15,6 +15,7 @@ from simultrans_baseline.providers.mock import (
     RuleBasedMockTranslator,
     ScriptedASR,
 )
+from simultrans_baseline.speaker import SpeakerChangeDetector
 from simultrans_baseline.sinks import NullAudioSink
 
 
@@ -43,6 +44,124 @@ def window(segment: int, duration_ms: int, final: bool, started: float) -> Audio
 
 
 class PipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tts_prebuffer_smooths_initial_cloud_chunks(self) -> None:
+        config = apply_overrides(
+            load_config(ROOT / "configs" / "mock.toml"),
+            audio_output=True,
+            voice_consent=True,
+        )
+        config = replace(
+            config,
+            streaming=replace(config.streaming, tts_prebuffer_ms=250),
+        )
+
+        class ChunkedTTS(MockCloningTTS):
+            def __init__(self):
+                super().__init__()
+                self.yield_count = 0
+
+            async def synthesize(self, text, *, language, profile_id):
+                self.synthesized.append((text, profile_id))
+                chunk = AudioChunk(b"\x00\x00" * 2400, 24_000)
+                for _ in range(3):
+                    self.yield_count += 1
+                    yield chunk
+                    await asyncio.sleep(0)
+
+        class RecordingSink:
+            def __init__(self, tts):
+                self.tts = tts
+                self.yields_at_first_write = None
+
+            async def write(self, chunk, *, segment_id):
+                del chunk, segment_id
+                if self.yields_at_first_write is None:
+                    self.yields_at_first_write = self.tts.yield_count
+
+            async def interrupt(self):
+                return None
+
+            async def aclose(self):
+                return None
+
+        tts = ChunkedTTS()
+        sink = RecordingSink(tts)
+        events: list[PipelineEvent] = []
+        pipeline = RealtimeInterpretationPipeline(
+            config,
+            asr=ScriptedASR(["测试连续播放。"]),
+            translator=RuleBasedMockTranslator(),
+            endpoint=HeuristicSemanticEndpoint(),
+            tts=tts,
+            audio_sink=sink,
+            event_handler=events.append,
+        )
+        started = time.monotonic()
+        await pipeline.run(Source([window(1, 3000, True, started)]))
+        self.assertEqual(sink.yields_at_first_write, 3)
+        metrics = next(event for event in events if event.kind == "turn.metrics")
+        self.assertIn("first_cloud_audio_ms", metrics.data)
+        self.assertIn("playback_queue_ms", metrics.data)
+
+    async def test_next_tts_is_generated_while_previous_audio_is_playing(self) -> None:
+        config = apply_overrides(
+            load_config(ROOT / "configs" / "mock.toml"),
+            audio_output=True,
+            voice_consent=True,
+        )
+        synthesis_started: list[float] = []
+
+        class FastTTS(MockCloningTTS):
+            async def synthesize(self, text, *, language, profile_id):
+                self.synthesized.append((text, profile_id))
+                synthesis_started.append(time.monotonic())
+                yield AudioChunk(b"\x00\x00" * 100, self.sample_rate)
+                yield AudioChunk(b"\x00\x00" * 100, self.sample_rate)
+
+        class SlowSink:
+            def __init__(self):
+                self.first_segment: str | None = None
+                self.first_writes = 0
+                self.first_finished: float | None = None
+
+            async def write(self, chunk, *, segment_id):
+                if self.first_segment is None:
+                    self.first_segment = segment_id
+                await asyncio.sleep(0.05)
+                if segment_id == self.first_segment:
+                    self.first_writes += 1
+                    if self.first_writes == 2:
+                        self.first_finished = time.monotonic()
+
+            async def interrupt(self):
+                return None
+
+            async def aclose(self):
+                return None
+
+        sink = SlowSink()
+        pipeline = RealtimeInterpretationPipeline(
+            config,
+            asr=ScriptedASR(["第一句话。", "第二句话。"]),
+            translator=RuleBasedMockTranslator(),
+            endpoint=HeuristicSemanticEndpoint(),
+            tts=FastTTS(),
+            audio_sink=sink,
+            event_handler=lambda event: None,
+        )
+        started = time.monotonic()
+        await pipeline.run(
+            Source(
+                [
+                    window(1, 3000, True, started),
+                    window(2, 3000, True, started),
+                ]
+            )
+        )
+        self.assertEqual(len(synthesis_started), 2)
+        self.assertIsNotNone(sink.first_finished)
+        self.assertLess(synthesis_started[1], sink.first_finished)
+
     async def test_independent_audio_output_is_not_cancelled_by_new_speech(self) -> None:
         config = apply_overrides(
             load_config(ROOT / "configs" / "mock.toml"),
@@ -137,6 +256,176 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(tts.deleted), 2)
         ready = [event for event in events if event.kind == "voice.ready"]
         self.assertEqual([event.data.get("refresh") for event in ready], [False, True])
+
+    async def test_speaker_gate_refreshes_only_after_detected_change(self) -> None:
+        config = apply_overrides(
+            load_config(ROOT / "configs" / "mock.toml"),
+            audio_output=True,
+            voice_consent=True,
+        )
+        events: list[PipelineEvent] = []
+        tts = MockCloningTTS()
+
+        class FakeEmbedder:
+            def __init__(self):
+                self.values = iter(
+                    ([1.0, 0.0], [0.99, 0.01], [0.0, 1.0])
+                )
+
+            def embed(self, pcm, *, sample_rate):
+                del pcm, sample_rate
+                return next(self.values)
+
+        speaker = SpeakerChangeDetector(
+            FakeEmbedder(),
+            SpeakerChangeConfig(enabled=True, model_path="mock"),
+        )
+        pipeline = RealtimeInterpretationPipeline(
+            config,
+            asr=ScriptedASR(["第一句。", "还是我。", "换人了。"]),
+            translator=RuleBasedMockTranslator(),
+            endpoint=HeuristicSemanticEndpoint(),
+            tts=tts,
+            audio_sink=NullAudioSink(),
+            event_handler=events.append,
+            speaker_change_detector=speaker,
+        )
+        started = time.monotonic()
+        await pipeline.run(
+            Source(
+                [
+                    window(1, 3_000, True, started),
+                    window(2, 3_000, True, started),
+                    window(3, 3_000, True, started),
+                ]
+            )
+        )
+        self.assertEqual(tts.enroll_calls, 2)
+        decisions = [event for event in events if event.kind == "speaker.decision"]
+        self.assertEqual(
+            [event.data["state"] for event in decisions],
+            ["initial", "same", "changed"],
+        )
+
+    async def test_bootstrap_does_not_mix_short_turns_from_two_speakers(self) -> None:
+        config = apply_overrides(
+            load_config(ROOT / "configs" / "mock.toml"),
+            audio_output=True,
+            voice_consent=True,
+        )
+        config = replace(
+            config,
+            voice_clone=replace(config.voice_clone, min_reference_ms=3_000),
+        )
+        events: list[PipelineEvent] = []
+
+        class FakeEmbedder:
+            def __init__(self):
+                self.values = iter(([1.0, 0.0], [0.0, 1.0], [0.01, 0.99]))
+
+            def embed(self, pcm, *, sample_rate):
+                del pcm, sample_rate
+                return next(self.values)
+
+        speaker = SpeakerChangeDetector(
+            FakeEmbedder(),
+            SpeakerChangeConfig(enabled=True, model_path="mock"),
+        )
+        tts = MockCloningTTS()
+        pipeline = RealtimeInterpretationPipeline(
+            config,
+            asr=ScriptedASR(["甲。", "乙第一句。", "乙第二句。"]),
+            translator=RuleBasedMockTranslator(),
+            endpoint=HeuristicSemanticEndpoint(),
+            tts=tts,
+            audio_sink=NullAudioSink(),
+            event_handler=events.append,
+            speaker_change_detector=speaker,
+        )
+        started = time.monotonic()
+        await pipeline.run(
+            Source(
+                [
+                    window(1, 2_200, True, started),
+                    window(2, 2_200, True, started),
+                    window(3, 2_200, True, started),
+                ]
+            )
+        )
+        enrollments = [
+            event for event in events if event.kind == "voice.enrollment_started"
+        ]
+        self.assertEqual(tts.enroll_calls, 1)
+        self.assertEqual([event.turn_id for event in enrollments], [3])
+
+    async def test_voice_refresh_does_not_block_tts_fifo(self) -> None:
+        config = apply_overrides(
+            load_config(ROOT / "configs" / "mock.toml"),
+            audio_output=True,
+            voice_consent=True,
+        )
+
+        class SlowRefreshTTS(MockCloningTTS):
+            def __init__(self):
+                super().__init__()
+                self.first_synthesized = asyncio.Event()
+                self.refresh_started = asyncio.Event()
+                self.second_synthesized = asyncio.Event()
+                self.allow_refresh = asyncio.Event()
+                self.prepare_calls = 0
+
+            async def enroll(self, *args, **kwargs):
+                return await super().enroll(*args, **kwargs)
+
+            async def prepare_voice(self, profile_id, *, language):
+                del profile_id, language
+                self.prepare_calls += 1
+                if self.prepare_calls == 2:
+                    self.refresh_started.set()
+                    await self.allow_refresh.wait()
+
+            async def synthesize(self, text, *, language, profile_id):
+                call_number = len(self.synthesized) + 1
+                async for chunk in super().synthesize(
+                    text,
+                    language=language,
+                    profile_id=profile_id,
+                ):
+                    if call_number == 1:
+                        self.first_synthesized.set()
+                    elif call_number == 2:
+                        self.second_synthesized.set()
+                    yield chunk
+
+        tts = SlowRefreshTTS()
+        pipeline = RealtimeInterpretationPipeline(
+            config,
+            asr=ScriptedASR(["第一句话。", "第二句话。"]),
+            translator=RuleBasedMockTranslator(),
+            endpoint=HeuristicSemanticEndpoint(),
+            tts=tts,
+            audio_sink=NullAudioSink(),
+            event_handler=lambda event: None,
+        )
+        started = time.monotonic()
+
+        class RefreshingSource:
+            async def __aiter__(self):
+                yield window(1, 3000, True, started)
+                await asyncio.wait_for(tts.first_synthesized.wait(), timeout=1)
+                first_profile = tts.synthesized[0][1]
+                yield window(2, 3000, True, started)
+                await asyncio.wait_for(tts.refresh_started.wait(), timeout=1)
+                await asyncio.wait_for(tts.second_synthesized.wait(), timeout=0.1)
+                self.second_profile = tts.synthesized[1][1]
+                self.first_profile = first_profile
+                tts.allow_refresh.set()
+
+        source = RefreshingSource()
+        await pipeline.run(source)
+        self.assertEqual(source.second_profile, source.first_profile)
+        self.assertEqual(tts.enroll_calls, 2)
+        self.assertEqual(tts.prepare_calls, 2)
 
     async def test_tts_failure_does_not_stop_text_pipeline(self) -> None:
         config = apply_overrides(

@@ -10,4 +10,5 @@ dist/
 *.egg-info/
 output/
 data/voice_profiles/
-
+models/
+.vendor/
