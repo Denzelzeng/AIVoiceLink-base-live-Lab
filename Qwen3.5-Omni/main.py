@@ -271,6 +271,11 @@ async def run(args: argparse.Namespace) -> int:
                 end_silence_ms=args.end_silence_ms,
                 max_segment_ms=args.max_segment_ms,
             )
+            print(
+                f"分段: {microphone_config.max_segment_ms} ms 后优先等待短停顿；"
+                f"连续语音安全上限 "
+                f"{microphone_config.max_segment_ms + microphone_config.max_segment_grace_ms} ms。"
+            )
             interpreter = MicrophoneInterpreter(
                 realtime_client,
                 microphone_config,

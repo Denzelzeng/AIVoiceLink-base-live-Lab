@@ -16,6 +16,7 @@
 
 工具与 `qwen3.5-omni-flash-realtime` 保持 WebSocket 会话，连续监听麦克风，以约
 600 ms 静音检测句尾，然后提交 PCM 语音。译文和模型语音会分别从实时事件流返回。
+Omni 是通用对话模型，工具会使用确定性采样和严格直译指令降低回答、解释和扩写风险。
 
 ## 安装
 
@@ -30,8 +31,12 @@
 交互式启动（选择输入语言、输出语言和是否播放语音）：
 
 ```powershell
-& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python '.\Qwen3.5-Omni\main.py'
+& '.\Qwen3.5-Omni\start.ps1'
 ```
+
+麦克风模式不要通过 `conda.bat run` 启动。`conda.bat` 是 Windows 批处理文件，收到
+Ctrl+C 后会额外询问 `Terminate batch job (Y/N)?`。`start.ps1` 直接调用环境内的
+`python.exe`，按一次 Ctrl+C 即关闭麦克风、播放队列和 WebSocket，不需要确认。
 
 直接启动中文到英文、文本加语音：
 
@@ -87,7 +92,16 @@ API 和模型列表：
 
 - 句尾反应太慢：降低 `--end-silence-ms`，例如 `450`。
 - 背景噪声触发误录：提高 `--energy-threshold`，例如 `600`。
-- 连续长句反馈太慢：降低 `--max-segment-ms`，例如 `5000`。
+- `--max-segment-ms` 是开始寻找自然短停顿的软目标，不会再在你持续说话时于该时刻
+  强行切断一句话。例如下面的命令从约 3 秒起寻找短停顿；若一直没有停顿，最多再等待
+  4 秒才会按安全上限切分：
+
+  ```powershell
+  & '.\Qwen3.5-Omni\start.ps1' --source-language Chinese --target-language English --text-only --max-segment-ms 3000 --end-silence-ms 400
+  ```
+
+  通用 Omni 模型仍然需要完整语义才能可靠直译。`--max-segment-ms` 设得过短会增加残句
+  和模型扩写风险；开启语音播放时还可能让外部麦克风再次收录译音。
 - 环境噪声会在启动时校准；用 `--calibration-seconds 0` 可关闭。
 
 ## Windows 麦克风故障排查

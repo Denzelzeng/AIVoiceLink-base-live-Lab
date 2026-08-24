@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import json
 import struct
 import tempfile
@@ -16,6 +17,7 @@ from qwen35_omni_client import (
     AudioPlayer,
     ClientConfig,
     MicrophoneConfig,
+    MicrophoneInterpreter,
     Qwen35OmniClient,
     Qwen35OmniRealtimeClient,
     SpeechSegmenter,
@@ -83,6 +85,47 @@ class SegmenterTests(unittest.TestCase):
         segmenter.add_frame(pcm_frame(1200))
         self.assertIsNone(segmenter.add_frame(pcm_frame(0)))
         self.assertIsNone(segmenter.add_frame(pcm_frame(0)))
+
+    def test_soft_limit_does_not_split_continuous_speech(self) -> None:
+        config = MicrophoneConfig(
+            frame_ms=50,
+            min_speech_ms=200,
+            end_silence_ms=600,
+            max_segment_ms=3000,
+            max_segment_grace_ms=4000,
+            soft_pause_ms=150,
+            calibration_seconds=0,
+        )
+        segmenter = SpeechSegmenter(config)
+        for _ in range(70):  # 3.5 seconds of uninterrupted speech
+            self.assertIsNone(segmenter.add_frame(pcm_frame(1200)))
+
+        self.assertIsNone(segmenter.add_frame(pcm_frame(0)))
+        self.assertIsNone(segmenter.add_frame(pcm_frame(0)))
+        self.assertIsNotNone(segmenter.add_frame(pcm_frame(0)))
+
+
+class CancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_microphone_cancel_stops_worker_and_audio_immediately(self) -> None:
+        shared_audio = MagicMock()
+        pyaudio_module = SimpleNamespace(PyAudio=MagicMock(return_value=shared_audio))
+
+        class CancelledInterpreter(MicrophoneInterpreter):
+            async def _capture_loop(self, audio: object) -> None:
+                raise asyncio.CancelledError
+
+            async def _translation_worker(self) -> None:
+                await asyncio.Event().wait()
+
+        client = SimpleNamespace()
+        interpreter = CancelledInterpreter(
+            client, MicrophoneConfig(), play_audio=False
+        )
+        with patch.dict("sys.modules", {"pyaudio": pyaudio_module}):
+            with self.assertRaises(asyncio.CancelledError):
+                await interpreter.run()
+
+        shared_audio.terminate.assert_called_once()
 
 
 class CredentialTests(unittest.TestCase):
@@ -239,6 +282,8 @@ class RealtimeClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session["modalities"], ["text", "audio"])
         self.assertEqual(session["voice"], "Tina")
         self.assertEqual(session["audio"]["input"]["format"]["sample_rate"], 16_000)
+        self.assertEqual(session["temperature"], 0.0)
+        self.assertEqual(session["top_k"], 1)
         self.assertEqual(
             session["input_audio_transcription"]["model"],
             "qwen3-asr-flash-realtime",
