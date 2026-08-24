@@ -7,7 +7,7 @@ import wave
 
 import httpx
 
-from local_deploy.qwen3_omni_client import (
+from local_deployment_pipeline.qwen3_omni_client import (
     ASRConfig,
     ClientConfig,
     InterpretationPipeline,

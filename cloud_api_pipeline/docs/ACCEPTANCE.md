@@ -52,6 +52,6 @@
 JSONL 汇总：
 
 ```powershell
-& '.\simultrans_baseline\scripts\summarize-events.ps1' `
-  '.\simultrans_baseline\output\session.jsonl'
+& '.\cloud_api_pipeline\scripts\summarize-events.ps1' `
+  '.\cloud_api_pipeline\output\session.jsonl'
 ```

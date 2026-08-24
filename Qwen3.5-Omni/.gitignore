@@ -1,4 +1,0 @@
-*.wav
-voice_profile.json
-__pycache__/
-.pytest_cache/

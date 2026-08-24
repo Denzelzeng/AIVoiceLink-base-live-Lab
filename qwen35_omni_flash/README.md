@@ -1,4 +1,6 @@
-# Qwen3.5-Omni 实时语音翻译工具
+# Qwen3.5-Omni Flash 单模型实时语音翻译工具
+
+目录名为 `qwen35_omni_flash`。麦克风实时路径只使用 `qwen3.5-omni-flash-realtime` 的模型原生能力，不调用独立 ASR、MT 或 TTS 服务；`--text` 和未加 `--realtime` 的 `--file` 是保留的 HTTP 验证路径，可通过 `QWEN35_OMNI_MODEL` 指定模型。
 
 这是一个使用阿里云百炼 `qwen3.5-omni-flash-realtime` 的连续麦克风口译客户端，
 支持模型原生文本和语音输出。
@@ -23,7 +25,7 @@ Omni 是通用对话模型，工具会使用确定性采样和严格直译指令
 在仓库根目录执行：
 
 ```powershell
-& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python -m pip install -r '.\Qwen3.5-Omni\requirements.txt'
+& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python -m pip install -r '.\qwen35_omni_flash\requirements.txt'
 ```
 
 ## 运行
@@ -31,7 +33,7 @@ Omni 是通用对话模型，工具会使用确定性采样和严格直译指令
 交互式启动（选择输入语言、输出语言和是否播放语音）：
 
 ```powershell
-& '.\Qwen3.5-Omni\start.ps1'
+& '.\qwen35_omni_flash\start.ps1'
 ```
 
 麦克风模式不要通过 `conda.bat run` 启动。`conda.bat` 是 Windows 批处理文件，收到
@@ -41,21 +43,21 @@ Ctrl+C 后会额外询问 `Terminate batch job (Y/N)?`。`start.ps1` 直接调�
 直接启动中文到英文、文本加语音：
 
 ```powershell
-& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python '.\Qwen3.5-Omni\main.py' --source-language Chinese --target-language English --audio-output
+& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python '.\qwen35_omni_flash\main.py' --source-language Chinese --target-language English --audio-output
 ```
 
 仅文本输出：
 
 ```powershell
-& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python '.\Qwen3.5-Omni\main.py' --source-language Cantonese --target-language Chinese --text-only
+& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python '.\qwen35_omni_flash\main.py' --source-language Cantonese --target-language Chinese --text-only
 ```
 
 列出麦克风设备并指定其中一个：
 
 ```powershell
-& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python '.\Qwen3.5-Omni\main.py' --list-devices
+& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python '.\qwen35_omni_flash\main.py' --list-devices
 
-& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python '.\Qwen3.5-Omni\main.py' --source-language Chinese --target-language English --audio-output --device-index 1
+& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python '.\qwen35_omni_flash\main.py' --source-language Chinese --target-language English --audio-output --device-index 1
 ```
 
 ## 单次验证
@@ -63,25 +65,25 @@ Ctrl+C 后会额外询问 `Terminate batch job (Y/N)?`。`start.ps1` 直接调�
 API 和模型列表：
 
 ```powershell
-& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python '.\Qwen3.5-Omni\main.py' --check
+& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python '.\qwen35_omni_flash\main.py' --check
 ```
 
 翻译文字：
 
 ```powershell
-& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python '.\Qwen3.5-Omni\main.py' --text '欢迎参加今天的会议。' --source-language Chinese --target-language English --text-only
+& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python '.\qwen35_omni_flash\main.py' --text '欢迎参加今天的会议。' --source-language Chinese --target-language English --text-only
 ```
 
 翻译音频并保存语音译文：
 
 ```powershell
-& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python '.\Qwen3.5-Omni\main.py' --file '.\sample.wav' --target-language English --audio-output --save-audio '.\translation.wav'
+& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python '.\qwen35_omni_flash\main.py' --file '.\official_api_examples\test_audio.wav' --target-language English --audio-output --save-audio '.\translation.wav'
 ```
 
 强制用 `qwen3.5-omni-flash-realtime` 验证模型原生语音返回：
 
 ```powershell
-& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python '.\Qwen3.5-Omni\main.py' --file '.\sample.wav' --realtime --source-language Chinese --target-language English --audio-output --save-audio '.\omni-realtime.wav'
+& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python '.\qwen35_omni_flash\main.py' --file '.\official_api_examples\test_audio.wav' --realtime --source-language Chinese --target-language English --audio-output --save-audio '.\omni-realtime.wav'
 ```
 
 麦克风模式默认使用 `qwen3.5-omni-flash-realtime`；HTTP 模型仅保留给文字和普通
@@ -97,7 +99,7 @@ API 和模型列表：
   4 秒才会按安全上限切分：
 
   ```powershell
-  & '.\Qwen3.5-Omni\start.ps1' --source-language Chinese --target-language English --text-only --max-segment-ms 3000 --end-silence-ms 400
+  & '.\qwen35_omni_flash\start.ps1' --source-language Chinese --target-language English --text-only --max-segment-ms 3000 --end-silence-ms 400
   ```
 
   通用 Omni 模型仍然需要完整语义才能可靠直译。`--max-segment-ms` 设得过短会增加残句
@@ -115,4 +117,4 @@ API 和模型列表：
   16-bit PCM 正确重采样为 Realtime 会话使用的 16 kHz；不会用设备不支持的采样率
   强行打开麦克风。
 
-运行 `python .\Qwen3.5-Omni\main.py --help` 查看全部选项。
+运行 `python .\qwen35_omni_flash\main.py --help` 查看全部选项。

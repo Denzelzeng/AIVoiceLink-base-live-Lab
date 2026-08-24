@@ -1,4 +1,6 @@
-# 模块分立实时同声传译 baseline（纯 API 版）
+# 模块分立实时同声传译：云 API 流水线
+
+目录名为 `cloud_api_pipeline`；Python 发行包和 CLI 仍保留 `simultrans_baseline`，以兼容现有脚本与导入。
 
 本版本的所有模型能力都通过远端 HTTPS API 调用，运行进程不会加载、下载或推理任何
 本地模型：
@@ -74,29 +76,29 @@ WORKSPACE_API_BASE_URL=https://WORKSPACE_ID.cn-beijing.maas.aliyuncs.com
 首次运行先安装约 19 MB 本地运行时并下载约 29 MB 模型：
 
 ```powershell
-& '.\simultrans_baseline\scripts\setup-local-audio.ps1'
+& '.\cloud_api_pipeline\scripts\setup-local-audio.ps1'
 ```
 
 先检查远端目录和声音管理 API；此命令不会创建音色或执行 TTS：
 
 ```powershell
-& '.\simultrans_baseline\scripts\run.ps1' doctor --voice-consent
+& '.\cloud_api_pipeline\scripts\run.ps1' doctor --voice-consent
 ```
 
 仅文字同传：
 
 ```powershell
-& '.\simultrans_baseline\scripts\run.ps1' run `
+& '.\cloud_api_pipeline\scripts\run.ps1' run `
   --source-language Chinese --target-language English --text-only
 ```
 
 启用人声复刻和译音：
 
 ```powershell
-& '.\simultrans_baseline\scripts\run.ps1' run `
+& '.\cloud_api_pipeline\scripts\run.ps1' run `
   --source-language Chinese --target-language English `
   --audio-output --voice-consent `
-  --events '.\simultrans_baseline\output\session.jsonl'
+  --events '.\cloud_api_pipeline\output\session.jsonl'
 ```
 
 不传 `--source-language/--target-language` 时，交互终端会先显示编号语言菜单。自动化脚本
@@ -128,15 +130,15 @@ barge-in，译音按 FIFO 一直播放完，麦克风中的新讲话只参与 AS
 WAV 回放必须与配置一致，即默认 24 kHz、单声道、PCM16：
 
 ```powershell
-& '.\simultrans_baseline\scripts\run.ps1' run `
+& '.\cloud_api_pipeline\scripts\run.ps1' run `
   --wav '.\sample-24k-mono.wav' --text-only --no-realtime
 ```
 
 离线控制流演示和测试：
 
 ```powershell
-& '.\simultrans_baseline\scripts\run.ps1' demo --audio-output
-& '.\simultrans_baseline\scripts\test.ps1'
+& '.\cloud_api_pipeline\scripts\run.ps1' demo --audio-output
+& '.\cloud_api_pipeline\scripts\test.ps1'
 ```
 
 ## 目录

@@ -5,7 +5,7 @@
 *apiKey*.csv
 
 # Python bytecode, virtual environments, and test tooling
-__pycache__/
+**/__pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
@@ -16,7 +16,21 @@ htmlcov/
 .venv/
 venv/
 
-# Local editor configuration and generated results
+# Local editor configuration
 .vscode/
+
+# Generated runtime data and local model/runtime downloads
 tmp/
-AGENTS.md
+**/output/
+**/artifacts/
+**/recordings/
+*.jsonl
+*.log
+**/.vendor/
+**/models/
+**/data/voice_profiles/
+ast_python/
+
+# Omni Realtime recordings and enrolled-voice metadata
+qwen35_omni_flash/*.wav
+qwen35_omni_flash/voice_profile.json
