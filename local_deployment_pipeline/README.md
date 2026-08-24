@@ -22,48 +22,48 @@
 
 ## 安装与运行
 
-使用仓库 `AGENTS.md` 指定的环境：
+在仓库根目录、已激活的 Python 3.11+ 虚拟环境中执行：
 
 ```powershell
-& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python -m pip install -r .\local_deployment_pipeline\requirements.txt
+python -m pip install -r .\local_deployment_pipeline\requirements.txt
 ```
 
 先检查服务：
 
 ```powershell
-& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python .\local_deployment_pipeline\main.py --check
+python .\local_deployment_pipeline\main.py --check
 ```
 
 纯文字同传模式：
 
 ```powershell
-& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python .\local_deployment_pipeline\main.py --stdin --source-language Chinese --target-language English
+python .\local_deployment_pipeline\main.py --stdin --source-language Chinese --target-language English
 ```
 
 也可以单次验证：
 
 ```powershell
-& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python .\local_deployment_pipeline\main.py --text '你好，欢迎参加今天的会议。' --source-language Chinese --target-language English
+python .\local_deployment_pipeline\main.py --text '你好，欢迎参加今天的会议。' --source-language Chinese --target-language English
 ```
 
 列出麦克风，再启动中文到英文同传：
 
 ```powershell
-& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python .\local_deployment_pipeline\main.py --list-devices
+python .\local_deployment_pipeline\main.py --list-devices
 
-& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python .\local_deployment_pipeline\main.py --source-language Chinese --target-language English
+python .\local_deployment_pipeline\main.py --source-language Chinese --target-language English
 ```
 
 翻译一个音频文件：
 
 ```powershell
-& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python .\local_deployment_pipeline\main.py --target-language Chinese --file .\official_api_examples\test_audio.wav
+python .\local_deployment_pipeline\main.py --target-language Chinese --file .\official_api_examples\test_audio.wav
 ```
 
 如果 8003 后续按完整多模态 Qwen3-Omni 重新部署，可跳过 8004：
 
 ```powershell
-& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python .\local_deployment_pipeline\main.py --audio-backend direct
+python .\local_deployment_pipeline\main.py --audio-backend direct
 ```
 
 也可复制 `.env.example` 为仓库根目录的 `.env` 并修改默认配置。本地服务无需
@@ -82,5 +82,5 @@ API Key；只有反向代理要求鉴权时才设置 `QWEN_OMNI_API_KEY`。
 ## 测试
 
 ```powershell
-& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python -m unittest discover -s .\local_deployment_pipeline\tests -v
+python -m unittest discover -s .\local_deployment_pipeline\tests -v
 ```

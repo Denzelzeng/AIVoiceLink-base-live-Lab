@@ -71,6 +71,10 @@ WORKSPACE_API_BASE_URL=https://WORKSPACE_ID.cn-beijing.maas.aliyuncs.com
 
 配置校验会拒绝 `localhost`、`127.0.0.1` 和非 HTTPS 模型地址，避免误回到本地模型。
 
+## 环境
+
+需要 Python 3.11+ 和已激活的虚拟环境。各 PowerShell 脚本会使用当前环境的 `python`；如需明确指定解释器，可在启动前设置 `$env:PYTHON` 为 Python 可执行文件路径。
+
 ## 运行
 
 首次运行先安装约 19 MB 本地运行时并下载约 29 MB 模型：

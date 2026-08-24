@@ -11,10 +11,10 @@
 
 ## 安装
 
-在仓库根目录执行：
+在仓库根目录、已激活的 Python 3.11+ 虚拟环境中执行：
 
 ```powershell
-& 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python -m pip install -r '.\official_api_examples\requirements.txt'
+python -m pip install -r '.\official_api_examples\requirements.txt'
 ```
 
 ## 配置与启动
@@ -24,13 +24,13 @@
 - 百炼示例需要 `DASHSCOPE_API_KEY`：
 
   ```powershell
-  & 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python '.\official_api_examples\main.py'
+  python '.\official_api_examples\main.py'
   ```
 
 - 火山引擎 AST 示例需要 `AST_API_KEY`，或 `AST_APP_KEY` 与 `AST_ACCESS_KEY`。此外，请将官方 SDK 生成的 `ast_python/python_protogen` 放在仓库根目录（已忽略）：
 
   ```powershell
-  & 'D:\ProgramData\miniforge3\condabin\conda.bat' run --no-capture-output -p 'D:\ProgramData\miniforge3\envs\aivoicelink' python '.\official_api_examples\main_ast.py'
+  python '.\official_api_examples\main_ast.py'
   ```
 
 两个示例都会打开麦克风和扬声器；建议使用耳机，避免译音被再次采集。

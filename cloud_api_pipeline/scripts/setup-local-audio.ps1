@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$pythonExe = 'D:\ProgramData\miniforge3\envs\aivoicelink\python.exe'
+$pythonExe = if ($env:PYTHON) { $env:PYTHON } else { (Get-Command python -ErrorAction Stop).Source }
 $vendorDir = Join-Path $projectRoot '.vendor'
 $modelDir = Join-Path $projectRoot 'models'
 

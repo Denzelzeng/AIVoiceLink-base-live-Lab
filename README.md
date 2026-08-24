@@ -13,7 +13,15 @@
 
 ## 环境与凭据
 
-- Windows 命令使用仓库 `AGENTS.md` 指定的 Conda 环境：`D:\ProgramData\miniforge3\envs\aivoicelink`。
+- 所有命令假定已激活 Python 3.11+ 虚拟环境。Windows PowerShell 可按下面方式创建并激活环境：
+
+  ```powershell
+  python -m venv .venv
+  .\.venv\Scripts\Activate.ps1
+  python -m pip install --upgrade pip
+  ```
+
+  也可使用 Conda、uv 或其他环境管理工具；后续示例统一使用当前环境中的 `python`。
 - 根目录 `.env` 和 `Default Workspace-apiKey-*.csv` 仅保存本机凭据，已被 Git 忽略；各项目的 `.env.example` 只提供非敏感配置模板。
 - 每个实现各自维护 `requirements.txt`（云 API 流水线还提供 `pyproject.toml`）。进入目标目录后按其 README 安装依赖。
 - `official_api_examples/main_ast.py` 还需要火山引擎 SDK 生成的 `ast_python/python_protogen` 目录放在仓库根目录；该第三方生成目录不纳入版本控制。
